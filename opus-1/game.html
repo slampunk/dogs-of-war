@@ -1,0 +1,2698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DOGS OF WAR</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0a0c08;overflow:hidden;}
+  body{font-family:"Courier New",Courier,monospace;color:#d8e0c0;}
+  #cv{display:block;width:100vw;height:100vh;cursor:none;background:#2c2a1e;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+
+/* ============================================================================
+   DOGS OF WAR - a top-down run-and-gun.
+   Single file, Canvas 2D, everything procedural.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- utilities */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+function angDiff(a, b) { let d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
+function approachAngle(a, b, step) { const d = angDiff(a, b); return a + clamp(d, -step, step); }
+
+// deterministic PRNG so a level layout is reproducible within a run
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ------------------------------------------------------------------- canvas */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha: false });
+let VW = 960, VH = 600, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  VW = window.innerWidth;
+  VH = window.innerHeight;
+  cv.width = Math.floor(VW * DPR);
+  cv.height = Math.floor(VH * DPR);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// world units visible on screen; the zoom keeps the sprites chunky
+const ZOOM = 1.3;
+const viewW = () => VW / ZOOM;
+const viewH = () => VH / ZOOM;
+
+/* -------------------------------------------------------------------- world */
+const WORLD = { w: 2000, h: 7600 };   // north = small y, player pushes up
+
+/* -------------------------------------------------------------------- input */
+const keys = Object.create(null);
+const mouse = { x: VW / 2, y: VH / 2, down: false };
+
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].indexOf(e.code) >= 0) e.preventDefault();
+  onKeyPress(e.code);
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; mouse.down = false; });
+cv.addEventListener('mousemove', e => {
+  const r = cv.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+cv.addEventListener('mousedown', e => { if (e.button === 0) { mouse.down = true; onClick(); } });
+window.addEventListener('mouseup', e => { if (e.button === 0) mouse.down = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ------------------------------------------------------------------- camera */
+const cam = { x: 0, y: 0, shake: 0, sx: 0, sy: 0 };
+
+function updateCamera(dt) {
+  const tx = clamp(player.x - viewW() / 2, 0, Math.max(0, WORLD.w - viewW()));
+  const ty = clamp(player.y - viewH() / 2, 0, Math.max(0, WORLD.h - viewH()));
+  // gentle follow, snappy enough that the commando never trails off screen
+  const k = 1 - Math.pow(0.0008, dt);
+  cam.x = lerp(cam.x, tx, k);
+  cam.y = lerp(cam.y, ty, k);
+  if (cam.shake > 0) {
+    cam.shake = Math.max(0, cam.shake - dt * 26);
+    const m = cam.shake;
+    cam.sx = rnd(-m, m); cam.sy = rnd(-m, m);
+  } else { cam.sx = 0; cam.sy = 0; }
+}
+function snapCamera() {
+  cam.x = clamp(player.x - viewW() / 2, 0, Math.max(0, WORLD.w - viewW()));
+  cam.y = clamp(player.y - viewH() / 2, 0, Math.max(0, WORLD.h - viewH()));
+  cam.shake = 0; cam.sx = 0; cam.sy = 0;
+}
+function addShake(v) { cam.shake = Math.min(26, cam.shake + v); }
+const mouseWorldX = () => mouse.x / ZOOM + cam.x;
+const mouseWorldY = () => mouse.y / ZOOM + cam.y;
+
+/* ------------------------------------------------------------------ weapons */
+const WEAPONS = {
+  rifle: { key: 'rifle', name: 'RIFLE', rate: 0.13, dmg: 14, speed: 780, spr: 0.022, infinite: true, kick: 1.2, cas: true },
+  spread: { key: 'spread', name: 'SPREAD', rate: 0.40, dmg: 11, speed: 640, spr: 0.05, pellets: 5, arc: 0.52, ammo: 30, kick: 4.0, cas: true },
+  flame: { key: 'flame', name: 'FLAME', rate: 0.022, dmg: 0, ammo: 560, kick: 0.5, cas: false }
+};
+
+/* ------------------------------------------------------------------- player */
+const player = {
+  x: 0, y: 0, r: 11,
+  vx: 0, vy: 0,
+  speed: 172,
+  hp: 120, maxHp: 120,
+  aim: -Math.PI / 2,
+  walk: 0, moving: false, faceLeg: -Math.PI / 2,
+  cool: 0, weapon: WEAPONS.rifle, ammo: Infinity,
+  flash: 0, muzzle: 0, hurt: 0, dead: false,
+  iframe: 0, kills: 0
+};
+
+function resetPlayer() {
+  player.x = WORLD.w * 0.5;
+  player.y = WORLD.h - 220;
+  player.vx = player.vy = 0;
+  player.hp = player.maxHp;
+  player.aim = -Math.PI / 2;
+  player.faceLeg = -Math.PI / 2;
+  player.walk = 0; player.cool = 0;
+  player.weapon = WEAPONS.rifle; player.ammo = Infinity;
+  player.flash = 0; player.muzzle = 0; player.hurt = 0;
+  player.dead = false; player.iframe = 0; player.kills = 0;
+}
+
+function updatePlayer(dt) {
+  let ix = 0, iy = 0;
+  if (keys['KeyA'] || keys['ArrowLeft']) ix -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) ix += 1;
+  if (keys['KeyW'] || keys['ArrowUp']) iy -= 1;
+  if (keys['KeyS'] || keys['ArrowDown']) iy += 1;
+  // 8-way: normalise so diagonals are not faster
+  if (ix !== 0 || iy !== 0) {
+    const l = Math.hypot(ix, iy);
+    ix /= l; iy /= l;
+    player.moving = true;
+    player.faceLeg = approachAngle(player.faceLeg, Math.atan2(iy, ix), dt * 14);
+    player.walk += dt * 11;
+  } else {
+    player.moving = false;
+    player.walk += dt * 2.5;
+  }
+  player.vx = ix * player.speed;
+  player.vy = iy * player.speed;
+  moveCircle(player, player.vx * dt, player.vy * dt);
+  player.x = clamp(player.x, player.r, WORLD.w - player.r);
+  player.y = clamp(player.y, player.r, WORLD.h - player.r);
+
+  // aim always follows the cursor, independent of movement
+  player.aim = Math.atan2(mouseWorldY() - player.y, mouseWorldX() - player.x);
+
+  // boots kick up dust
+  if (player.moving) {
+    player.dust = (player.dust || 0) - dt;
+    if (player.dust <= 0) {
+      player.dust = 0.13;
+      spawnPart({
+        x: player.x - ix * 8 + rnd(-3, 3), y: player.y - iy * 8 + rnd(-3, 3),
+        vx: -ix * 18 + rnd(-8, 8), vy: -iy * 18 + rnd(-8, 8),
+        life: rnd(0.3, 0.55), r: rnd(2, 4), col: 'rgba(150,138,108,0.45)',
+        type: 'smoke', drag: 2.4, grow: 9
+      });
+    }
+  }
+
+  if (player.cool > 0) player.cool -= dt;
+  if (player.muzzle > 0) player.muzzle -= dt;
+  if (player.hurt > 0) player.hurt -= dt;
+  if (player.iframe > 0) player.iframe -= dt;
+}
+
+/* Axis-separated movement: resolve x, then y, so a body slides along cover
+   instead of sticking to it. Used by the player and by every enemy. */
+function moveCircle(e, dx, dy) {
+  e.x += dx;
+  resolveSolids(e, 1, 0);
+  e.y += dy;
+  resolveSolids(e, 0, 1);
+}
+
+/* ------------------------------------------------------------- draw: ground */
+let groundPat = null;
+function buildGroundPattern() {
+  const s = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const g = c.getContext('2d');
+  g.fillStyle = '#3c3a26';
+  g.fillRect(0, 0, s, s);
+  const r = mulberry32(1337);
+  for (let i = 0; i < 900; i++) {
+    const x = r() * s, y = r() * s, sz = 1 + r() * 2.4;
+    const t = r();
+    g.fillStyle = t < 0.34 ? 'rgba(72,68,44,0.55)' :
+                  t < 0.68 ? 'rgba(28,28,18,0.45)' : 'rgba(92,86,56,0.30)';
+    g.fillRect(x, y, sz, sz);
+  }
+  for (let i = 0; i < 26; i++) {
+    g.fillStyle = 'rgba(58,72,36,0.30)';
+    g.beginPath();
+    g.ellipse(r() * s, r() * s, 6 + r() * 12, 4 + r() * 7, r() * TAU, 0, TAU);
+    g.fill();
+  }
+  groundPat = ctx.createPattern(c, 'repeat');
+}
+
+let scenery = [];     // non-solid ground dressing
+function buildScenery() {
+  scenery = [];
+  const r = mulberry32(90210);
+  for (let i = 0; i < 1400; i++) {
+    const x = r() * WORLD.w, y = r() * WORLD.h;
+    const t = r();
+    scenery.push({
+      x, y,
+      k: t < 0.5 ? 'grass' : (t < 0.8 ? 'rock' : 'patch'),
+      s: 0.6 + r() * 1.6, a: r() * TAU, c: r()
+    });
+  }
+}
+
+function drawGround(vx0, vy0, vx1, vy1) {
+  ctx.fillStyle = groundPat;
+  ctx.fillRect(vx0, vy0, vx1 - vx0, vy1 - vy0);
+
+  // the churned dirt road running north up the middle of the valley
+  const rx = WORLD.w * 0.5;
+  ctx.fillStyle = 'rgba(74,64,42,0.55)';
+  ctx.fillRect(rx - 120, vy0, 240, vy1 - vy0);
+  ctx.fillStyle = 'rgba(30,26,16,0.25)';
+  ctx.fillRect(rx - 118, vy0, 12, vy1 - vy0);
+  ctx.fillRect(rx + 106, vy0, 12, vy1 - vy0);
+
+  for (let i = 0; i < scenery.length; i++) {
+    const s = scenery[i];
+    if (s.x < vx0 - 30 || s.x > vx1 + 30 || s.y < vy0 - 30 || s.y > vy1 + 30) continue;
+    if (s.k === 'grass') {
+      ctx.strokeStyle = s.c < 0.5 ? 'rgba(96,112,52,0.75)' : 'rgba(120,124,62,0.6)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let b = -1; b <= 1; b++) {
+        ctx.moveTo(s.x + b * 2.5, s.y + 2);
+        ctx.lineTo(s.x + b * 3.6 + Math.cos(s.a) * 2, s.y - 5 * s.s);
+      }
+      ctx.stroke();
+    } else if (s.k === 'rock') {
+      ctx.fillStyle = 'rgba(96,94,84,0.85)';
+      ctx.beginPath();
+      ctx.ellipse(s.x, s.y, 3 * s.s, 2.3 * s.s, s.a, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(20,20,14,0.35)';
+      ctx.beginPath();
+      ctx.ellipse(s.x + 1, s.y + 1.6, 3 * s.s, 2 * s.s, s.a, 0, TAU);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = s.c < 0.5 ? 'rgba(58,66,34,0.22)' : 'rgba(84,72,44,0.20)';
+      ctx.beginPath();
+      ctx.ellipse(s.x, s.y, 16 * s.s, 11 * s.s, s.a, 0, TAU);
+      ctx.fill();
+    }
+  }
+}
+
+/* ------------------------------------------------------------ draw: soldier */
+// Shared top-down soldier renderer: shadow, legs, torso, arms + weapon, helmet.
+function drawSoldier(o) {
+  const x = o.x, y = o.y;
+  ctx.save();
+  ctx.translate(x, y);
+
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.34)';
+  ctx.beginPath();
+  ctx.ellipse(2.5, 3.5, o.r * 1.15, o.r * 0.95, 0, 0, TAU);
+  ctx.fill();
+
+  // legs, driven by the walk cycle and facing the direction of travel
+  const swing = o.moving ? Math.sin(o.walk) * 4.2 : 0;
+  ctx.save();
+  ctx.rotate(o.faceLeg + Math.PI / 2);
+  ctx.fillStyle = o.legCol;
+  roundRect(-o.r * 0.62, -3 + swing, o.r * 0.52, o.r * 1.05, 2);
+  roundRect(o.r * 0.12, -3 - swing, o.r * 0.52, o.r * 1.05, 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.rotate(o.aim);
+
+  // torso
+  ctx.fillStyle = o.flash > 0 ? '#ffffff' : o.bodyCol;
+  roundRect(-o.r * 0.85, -o.r * 0.78, o.r * 1.7, o.r * 1.56, 4);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(10,10,8,0.65)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // webbing / pack on the back
+  ctx.fillStyle = o.flash > 0 ? '#ffffff' : o.packCol;
+  roundRect(-o.r * 0.92, -o.r * 0.5, o.r * 0.5, o.r, 2);
+  ctx.fill();
+
+  // arms + weapon, pointing exactly where the gun aims
+  ctx.fillStyle = o.flash > 0 ? '#ffffff' : o.armCol;
+  roundRect(o.r * 0.1, -o.r * 0.92, o.r * 0.8, o.r * 0.44, 2);
+  roundRect(o.r * 0.1, o.r * 0.48, o.r * 0.8, o.r * 0.44, 2);
+  ctx.fill();
+
+  drawWeaponSprite(o);
+
+  // slab shoulder armour marks out the heavies at a glance
+  if (o.armored) {
+    ctx.fillStyle = o.flash > 0 ? '#ffffff' : '#22252a';
+    roundRect(-o.r * 0.5, -o.r * 1.05, o.r * 1.1, o.r * 0.42, 2);
+    roundRect(-o.r * 0.5, o.r * 0.63, o.r * 1.1, o.r * 0.42, 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(10,10,8,0.7)'; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+
+  // helmet
+  ctx.fillStyle = o.flash > 0 ? '#ffffff' : o.helmCol;
+  ctx.beginPath();
+  ctx.arc(o.r * 0.06, 0, o.r * 0.62, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.beginPath();
+  ctx.arc(o.r * 0.06, 0, o.r * 0.62, -1.15, 1.15);
+  ctx.fill();
+  ctx.fillStyle = o.markCol || 'rgba(255,255,255,0.16)';
+  ctx.fillRect(o.r * 0.2, -1.2, o.r * 0.34, 2.4);
+
+  ctx.restore();
+}
+
+function drawWeaponSprite(o) {
+  const wk = o.weaponSprite || 'rifle';
+  const r = o.r;
+  ctx.fillStyle = '#22221c';
+  if (wk === 'spread') {
+    ctx.fillRect(r * 0.35, -3.4, r * 1.35, 6.8);
+    ctx.fillStyle = '#3a3226';
+    ctx.fillRect(r * 0.5, -2.0, r * 0.6, 4.0);
+  } else if (wk === 'flame') {
+    ctx.fillRect(r * 0.3, -3.0, r * 1.15, 6.0);
+    ctx.fillStyle = '#7a2a18';
+    ctx.fillRect(r * 1.35, -4.2, 5, 8.4);
+    ctx.fillStyle = '#4a4438';
+    ctx.fillRect(r * 0.0, -5.5, 5, 11);
+  } else if (wk === 'lmg') {
+    ctx.fillRect(r * 0.3, -2.6, r * 1.95, 5.2);
+    ctx.fillStyle = '#4a4438';
+    ctx.fillRect(r * 0.55, -6.5, 4, 13);          // drum magazine
+    ctx.fillStyle = '#15150f';
+    ctx.fillRect(r * 1.85, -1.6, r * 0.45, 3.2);
+    ctx.fillRect(r * 1.15, -7, 2, 14);            // bipod
+  } else if (wk === 'heavy') {
+    // an entrenching tool / trench club, held out to the side
+    ctx.save();
+    ctx.rotate(-0.5);
+    ctx.fillRect(r * 0.4, -2.4, r * 1.5, 4.8);
+    ctx.fillStyle = '#6e6a5e';
+    ctx.fillRect(r * 1.55, -6, 7, 12);
+    ctx.restore();
+  } else {
+    ctx.fillRect(r * 0.35, -2.2, r * 1.6, 4.4);
+    ctx.fillStyle = '#4a4034';
+    ctx.fillRect(r * 0.25, -2.0, r * 0.45, 4.0);
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// give the player object its palette
+player.bodyCol = '#5c6b3a'; player.legCol = '#46512c'; player.packCol = '#3b4426';
+player.armCol = '#6b7a45'; player.helmCol = '#7d8a4e'; player.markCol = 'rgba(220,230,180,0.5)';
+
+function drawPlayer() {
+  player.weaponSprite = player.weapon.key;
+  if (player.hurt > 0 && Math.floor(player.hurt * 30) % 2 === 0) ctx.globalAlpha = 0.55;
+  drawSoldier(player);
+  ctx.globalAlpha = 1;
+}
+
+/* -------------------------------------------------------------- crosshair */
+function drawCrosshair() {
+  const x = mouse.x, y = mouse.y;
+  ctx.save();
+  // hit marker: four brackets that snap in when a shot connects
+  if (hitMark > 0) {
+    const t = hitMark / 0.16;
+    const o = 5 + (1 - t) * 6;
+    ctx.strokeStyle = 'rgba(255,120,80,' + clamp(t, 0, 1).toFixed(2) + ')';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    for (let i = 0; i < 4; i++) {
+      const sx = (i & 1) ? 1 : -1, sy = (i & 2) ? 1 : -1;
+      ctx.moveTo(x + sx * o, y + sy * o);
+      ctx.lineTo(x + sx * (o + 6), y + sy * (o + 6));
+    }
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(230,240,190,0.9)';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.arc(x, y, 9, 0, TAU);
+  ctx.moveTo(x - 15, y); ctx.lineTo(x - 5, y);
+  ctx.moveTo(x + 5, y); ctx.lineTo(x + 15, y);
+  ctx.moveTo(x, y - 15); ctx.lineTo(x, y - 5);
+  ctx.moveTo(x, y + 5); ctx.lineTo(x, y + 15);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,90,50,0.95)';
+  ctx.fillRect(x - 1, y - 1, 2, 2);
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ hud/etc */
+const FONT = '"Courier New",Courier,monospace';
+// how far up the valley the commando has pushed, 0 at the drop zone, 1 at the post
+const advanceFrac = () => clamp(1 - (player.y - OBJ.y) / (WORLD.h - 220 - OBJ.y), 0, 1);
+let hitMark = 0;
+
+function panel(x, y, w, h) {
+  ctx.fillStyle = 'rgba(12,16,10,0.62)';
+  roundRect(x, y, w, h, 3); ctx.fill();
+  ctx.strokeStyle = 'rgba(190,205,150,0.35)';
+  ctx.lineWidth = 1;
+  roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 3); ctx.stroke();
+}
+
+function drawHUD() {
+  if (state === ST.TITLE) return;
+  ctx.save();
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+
+  /* ---- vitals + weapon, top left */
+  panel(14, 14, 250, 78);
+  const hpFrac = clamp(player.hp / player.maxHp, 0, 1);
+  ctx.font = 'bold 11px ' + FONT;
+  ctx.fillStyle = '#9fb27a';
+  ctx.fillText('VITALS', 26, 24);
+  const bx = 26, by = 38, bw = 226, bh = 14;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(bx, by, bw, bh);
+  const crit = hpFrac < 0.3;
+  const pulse = crit ? 0.72 + Math.sin(time * 9) * 0.28 : 1;
+  const g = ctx.createLinearGradient(bx, by, bx, by + bh);
+  g.addColorStop(0, crit ? 'rgba(240,90,60,' + pulse + ')' : 'rgba(140,200,90,1)');
+  g.addColorStop(1, crit ? 'rgba(150,30,20,' + pulse + ')' : 'rgba(80,140,50,1)');
+  ctx.fillStyle = g;
+  ctx.fillRect(bx, by, bw * hpFrac, bh);
+  if (healFlash > 0) {
+    ctx.fillStyle = 'rgba(220,255,220,' + (healFlash * 0.5).toFixed(2) + ')';
+    ctx.fillRect(bx, by, bw * hpFrac, bh);
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 6; i++) {
+    ctx.beginPath();
+    ctx.moveTo(bx + bw * i / 6, by); ctx.lineTo(bx + bw * i / 6, by + bh);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(200,215,160,0.5)';
+  ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+  ctx.font = 'bold 11px ' + FONT;
+  const hpTxt = Math.max(0, Math.round(player.hp)) + ' / ' + player.maxHp;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillText(hpTxt, bx + bw - 51, by + 3);
+  ctx.fillStyle = '#f2f6e2';
+  ctx.fillText(hpTxt, bx + bw - 52, by + 2);
+
+  // weapon line
+  const w = player.weapon;
+  ctx.font = 'bold 15px ' + FONT;
+  ctx.fillStyle = hudFlash > 0 && Math.floor(hudFlash * 12) % 2 === 0 ? '#ffffff' : '#ffe08a';
+  ctx.fillText(w.name, 26, 62);
+  ctx.font = 'bold 13px ' + FONT;
+  if (w.infinite) {
+    ctx.fillStyle = '#9fb27a';
+    ctx.fillText('UNLIMITED', 122, 64);
+  } else {
+    const frac = clamp(player.ammo / (w.ammo || 1), 0, 1);
+    const low = frac < 0.25;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = low && Math.floor(time * 6) % 2 === 0 ? '#ff6a4a' : '#e6ecd0';
+    ctx.fillText(String(player.ammo), 156, 64);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(166, 64, 86, 9);
+    ctx.fillStyle = low ? '#e05a34' : '#d8c060';
+    ctx.fillRect(166, 64, 86 * frac, 9);
+    ctx.strokeStyle = 'rgba(200,215,160,0.4)';
+    ctx.strokeRect(166.5, 64.5, 85, 8);
+  }
+
+  /* ---- kills + objective, top right */
+  panel(VW - 214, 14, 200, 78);
+  ctx.font = 'bold 11px ' + FONT;
+  ctx.fillStyle = '#9fb27a';
+  ctx.fillText('KILLS', VW - 202, 24);
+  ctx.font = 'bold 30px ' + FONT;
+  ctx.fillStyle = '#e6ecd0';
+  ctx.fillText(String(player.kills), VW - 202, 40);
+
+  const prog = advanceFrac();
+  ctx.font = 'bold 11px ' + FONT;
+  ctx.fillStyle = '#9fb27a';
+  ctx.fillText('ADVANCE', VW - 110, 24);
+  const px0 = VW - 110, py0 = 42, pw = 96, ph = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(px0, py0, pw, ph);
+  ctx.fillStyle = '#7aa0d0';
+  ctx.fillRect(px0, py0, pw * prog, ph);
+  ctx.strokeStyle = 'rgba(200,215,160,0.5)';
+  ctx.strokeRect(px0 + 0.5, py0 + 0.5, pw - 1, ph - 1);
+  ctx.fillStyle = '#c8342a';
+  ctx.fillRect(px0 + pw - 3, py0 - 3, 5, ph + 6);
+  ctx.fillStyle = '#9fb27a';
+  ctx.font = 'bold 10px ' + FONT;
+  ctx.fillText(Math.round(prog * 100) + '%', px0 + pw - 24, py0 + 14);
+
+  /* ---- objective callout once the command post is close */
+  const od = dist(player.x, player.y, OBJ.x, OBJ.y);
+  if (od < 1400) {
+    const sx = (OBJ.x - cam.x) * ZOOM, sy = (OBJ.y - cam.y) * ZOOM;
+    const onScreen = sx > 30 && sx < VW - 30 && sy > 30 && sy < VH - 30;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 12px ' + FONT;
+    const blink = 0.6 + Math.sin(time * 5) * 0.4;
+    ctx.globalAlpha = blink;
+    ctx.fillStyle = '#ffdc70';
+    if (onScreen) {
+      ctx.fillText('COMMAND POST', sx, sy - 68);
+      ctx.fillText('▼', sx, sy - 54);
+    } else {
+      // pin an arrow to the screen edge pointing at the post
+      const a = Math.atan2(sy - VH / 2, sx - VW / 2);
+      const ex = clamp(VW / 2 + Math.cos(a) * VW * 0.42, 40, VW - 40);
+      const ey = clamp(VH / 2 + Math.sin(a) * VH * 0.42, 40, VH - 40);
+      ctx.save();
+      ctx.translate(ex, ey);
+      ctx.rotate(a);
+      ctx.beginPath();
+      ctx.moveTo(14, 0); ctx.lineTo(-8, -9); ctx.lineTo(-8, 9);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+      ctx.fillText(Math.round(od) + 'm', ex, ey + 26);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+  }
+
+  ctx.restore();
+}
+
+/* -------------------------------------------------- full-screen overlays */
+let vig = null, vigKey = '';
+function vignette() {
+  const key = VW + 'x' + VH;
+  if (vigKey !== key) {
+    const g = ctx.createRadialGradient(VW / 2, VH / 2, Math.min(VW, VH) * 0.34, VW / 2, VH / 2, Math.max(VW, VH) * 0.78);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.62)');
+    vig = g; vigKey = key;
+  }
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, VW, VH);
+}
+
+function drawOverlays() {
+  vignette();
+  if (hurtFlash > 0) {
+    ctx.fillStyle = 'rgba(170,20,10,' + (hurtFlash * 0.30).toFixed(3) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+  }
+  // heartbeat when badly hurt
+  if (state === ST.PLAY && player.hp / player.maxHp < 0.3) {
+    const a = 0.14 + Math.sin(time * 9) * 0.1;
+    ctx.fillStyle = 'rgba(150,10,5,' + Math.max(0, a).toFixed(3) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+  }
+  if (healFlash > 0) {
+    ctx.fillStyle = 'rgba(90,220,120,' + (healFlash * 0.18).toFixed(3) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+  }
+}
+
+/* -------------------------------------------------------- title / end cards */
+function bigText(s, y, size, col, alpha) {
+  ctx.font = 'bold ' + size + 'px ' + FONT;
+  ctx.textAlign = 'center';
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillText(s, VW / 2 + 3, y + 3);
+  ctx.fillStyle = col;
+  ctx.fillText(s, VW / 2, y);
+  ctx.globalAlpha = 1;
+}
+
+function drawScreens() {
+  if (state === ST.TITLE) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(8,10,6,0.72)';
+    ctx.fillRect(0, 0, VW, VH);
+    const cy = VH / 2;
+    bigText('DOGS OF WAR', cy - 110, Math.min(78, VW / 9), '#d8e0b0');
+    ctx.fillStyle = '#8a2f22';
+    ctx.fillRect(VW / 2 - 190, cy - 74, 380, 4);
+    bigText('ONE COMMANDO. ONE VALLEY. NO EXTRACTION.', cy - 44, 15, '#a8b884');
+
+    ctx.textAlign = 'center';
+    ctx.font = '14px ' + FONT;
+    ctx.fillStyle = '#c8d4a4';
+    const lines = [
+      'W A S D   move  (8-way)',
+      'MOUSE     aim   -   LEFT CLICK  fire (hold)',
+      'Shoot crates for the spread gun and the flame gun.',
+      'Push north. Take the command post at the head of the valley.'
+    ];
+    for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], VW / 2, cy + 10 + i * 24);
+
+    const blink = 0.55 + Math.sin(time * 4) * 0.45;
+    bigText('CLICK TO DEPLOY', cy + 140, 26, '#ffdc70', blink);
+    ctx.restore();
+    return;
+  }
+
+  if (state === ST.DEAD || state === ST.WIN) {
+    const win = state === ST.WIN;
+    const fade = clamp(deathTimer / 0.8, 0, 1);
+    ctx.save();
+    ctx.fillStyle = 'rgba(6,6,4,' + (fade * 0.72).toFixed(3) + ')';
+    ctx.fillRect(0, 0, VW, VH);
+    const cy = VH / 2;
+    bigText(win ? 'OBJECTIVE TAKEN' : 'K.I.A.', cy - 70, win ? 56 : 86, win ? '#c8e07a' : '#c8382a', fade);
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = fade;
+    ctx.font = '16px ' + FONT;
+    ctx.fillStyle = '#c8d4a4';
+    const prog = advanceFrac();
+    ctx.fillText('CONFIRMED KILLS   ' + player.kills, VW / 2, cy - 6);
+    ctx.fillText('GROUND TAKEN      ' + Math.round(prog * 100) + '%', VW / 2, cy + 20);
+    ctx.fillText(win ? 'The valley is yours.' : 'The valley keeps another one.', VW / 2, cy + 54);
+    ctx.globalAlpha = 1;
+    if (deathTimer > 0.7) {
+      const blink = 0.5 + Math.sin(time * 4) * 0.5;
+      bigText('CLICK TO REDEPLOY', cy + 108, 24, '#ffdc70', blink);
+    }
+    ctx.restore();
+  }
+}
+
+/* ============================================================================
+   COMBAT: projectiles, particles, decals, enemies
+   ========================================================================== */
+let bullets = [];    // player shots
+let ebullets = [];   // enemy shots
+let parts = [];      // short-lived particles
+let decals = [];     // permanent ground marks (blood, scorch, bodies)
+let enemies = [];
+let flames = [];
+let pickups = [];
+let rings = [];
+let grenades = [];
+
+const MAX_DECALS = 500;
+
+function resetCombat() {
+  bullets = []; ebullets = []; parts = []; decals = [];
+  enemies = []; flames = []; pickups = []; grenades = [];
+  obstacles = []; ogrid = null; rings = [];
+}
+
+/* --------------------------------------------------------------- particles */
+function spawnPart(o) {
+  parts.push({
+    x: o.x, y: o.y, vx: o.vx || 0, vy: o.vy || 0,
+    life: o.life, max: o.life, r: o.r || 2, col: o.col || '#fff',
+    type: o.type || 'spark', drag: o.drag === undefined ? 3.0 : o.drag,
+    rot: o.rot || 0, vr: o.vr || 0, grow: o.grow || 0
+  });
+}
+function addDecal(d) {
+  decals.push(d);
+  if (decals.length > MAX_DECALS) decals.splice(0, decals.length - MAX_DECALS);
+}
+
+function burstBlood(x, y, dirx, diry, n, col) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.atan2(diry, dirx) + rnd(-0.9, 0.9);
+    const s = rnd(40, 190);
+    spawnPart({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.25, 0.6), r: rnd(1.4, 3.2), col: col || '#8e1414', type: 'blood', drag: 5 });
+  }
+  if (Math.random() < 0.7) {
+    addDecal({ type: 'blood', x: x + rnd(-6, 6), y: y + rnd(-6, 6), r: rnd(5, 13), rot: rnd(0, TAU), col: col || '#4d0c0c', a: rnd(0.35, 0.65) });
+  }
+}
+function burstDebris(x, y, n, col) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, TAU), s = rnd(60, 300);
+    spawnPart({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.3, 0.85), r: rnd(1.5, 4), col, type: 'debris', drag: 4, rot: rnd(0, TAU), vr: rnd(-14, 14) });
+  }
+}
+function puffSmoke(x, y, n, col, sp) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, TAU), s = rnd(6, sp || 40);
+    spawnPart({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.4, 1.1), r: rnd(3, 8), col: col || 'rgba(120,120,110,0.5)', type: 'smoke', drag: 1.6, grow: rnd(10, 26) });
+  }
+}
+
+// expanding shock rings: kills and explosions read instantly at a glance
+function updateRings(dt) {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.life -= dt;
+    r.r += r.grow * dt;
+    if (r.life <= 0) rings.splice(i, 1);
+  }
+}
+function drawRings() {
+  for (let i = 0; i < rings.length; i++) {
+    const r = rings[i];
+    const t = r.life / r.max;
+    ctx.strokeStyle = 'rgba(255,240,210,' + (t * 0.55).toFixed(3) + ')';
+    ctx.lineWidth = 2 + t * 2;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, TAU);
+    ctx.stroke();
+  }
+}
+
+function updateParts(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt;
+    if (p.life <= 0) {
+      if (p.type === 'blood' && Math.random() < 0.5) {
+        addDecal({ type: 'blood', x: p.x, y: p.y, r: rnd(2, 5), rot: rnd(0, TAU), col: '#4d0c0c', a: rnd(0.3, 0.55) });
+      }
+      parts.splice(i, 1); continue;
+    }
+    const d = Math.exp(-p.drag * dt);
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= d; p.vy *= d;
+    p.rot += p.vr * dt;
+    if (p.grow) p.r += p.grow * dt;
+  }
+}
+
+function drawParts() {
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    const t = p.life / p.max;
+    if (p.type === 'smoke') {
+      ctx.globalAlpha = clamp(t * 0.55, 0, 1);
+      ctx.fillStyle = p.col;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    } else if (p.type === 'casing' || p.type === 'debris') {
+      ctx.globalAlpha = clamp(t * 1.6, 0, 1);
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+      ctx.fillStyle = p.col;
+      ctx.fillRect(-p.r, -p.r * 0.45, p.r * 2, p.r * 0.9);
+      ctx.restore();
+    } else if (p.type === 'flame') {
+      drawFlamePart(p, t);
+    } else {
+      ctx.globalAlpha = clamp(t * 1.5, 0, 1);
+      ctx.fillStyle = p.col;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawDecals(vx0, vy0, vx1, vy1) {
+  for (let i = 0; i < decals.length; i++) {
+    const d = decals[i];
+    if (d.x < vx0 - 60 || d.x > vx1 + 60 || d.y < vy0 - 60 || d.y > vy1 + 60) continue;
+    if (d.type === 'body') { drawCorpse(d); continue; }
+    ctx.globalAlpha = d.a;
+    ctx.fillStyle = d.col;
+    ctx.save(); ctx.translate(d.x, d.y); ctx.rotate(d.rot);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, d.r, d.r * 0.72, 0, 0, TAU);
+    ctx.fill();
+    if (d.type === 'blood') {
+      for (let k = 0; k < 3; k++) {
+        const a = d.rot + k * 2.1;
+        ctx.beginPath();
+        ctx.arc(Math.cos(a) * d.r * 1.15, Math.sin(a) * d.r * 0.95, d.r * 0.28, 0, TAU);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCorpse(d) {
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  ctx.rotate(d.rot);
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(2, 3, d.r * 1.2, d.r * 0.9, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = d.legCol;
+  roundRect(-d.r * 0.7, -d.r * 0.9, d.r * 0.5, d.r * 1.0, 2);
+  roundRect(-d.r * 0.7, -d.r * 0.1, d.r * 0.5, d.r * 1.0, 2);
+  ctx.fill();
+  ctx.fillStyle = d.bodyCol;
+  roundRect(-d.r * 0.85, -d.r * 0.8, d.r * 1.7, d.r * 1.6, 4);
+  ctx.fill();
+  ctx.fillStyle = d.helmCol;
+  ctx.beginPath(); ctx.arc(d.r * 0.75, 0, d.r * 0.6, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/* --------------------------------------------------------------- projectiles */
+function spawnBullet(list, x, y, ang, speed, dmg, col, opt) {
+  opt = opt || {};
+  list.push({
+    x, y, px: x, py: y,
+    vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
+    dmg, col, life: opt.life || 1.7, r: opt.r || 2.2,
+    len: opt.len || 9, hot: opt.hot || false
+  });
+}
+
+function updateBullets(dt) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.px = b.x; b.py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.life -= dt;
+    let dead = b.life <= 0 || b.x < 0 || b.y < 0 || b.x > WORLD.w || b.y > WORLD.h;
+    if (!dead && hitsSolid(b)) { bulletImpact(b, '#c9c2a4'); dead = true; }
+    if (!dead) {
+      for (let j = 0; j < enemies.length; j++) {
+        const e = enemies[j];
+        if (e.dead) continue;
+        if (dist2(b.x, b.y, e.x, e.y) < (e.r + b.r) * (e.r + b.r)) {
+          damageEnemy(e, b.dmg, b.vx, b.vy);
+          bulletImpact(b, '#b02020');
+          dead = true; break;
+        }
+      }
+    }
+    if (dead) bullets.splice(i, 1);
+  }
+
+  for (let i = ebullets.length - 1; i >= 0; i--) {
+    const b = ebullets[i];
+    b.px = b.x; b.py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.life -= dt;
+    let dead = b.life <= 0 || b.x < 0 || b.y < 0 || b.x > WORLD.w || b.y > WORLD.h;
+    if (!dead && hitsSolid(b)) { bulletImpact(b, '#c9c2a4'); dead = true; }
+    if (!dead && !player.dead && player.iframe <= 0 &&
+        dist2(b.x, b.y, player.x, player.y) < (player.r + b.r) * (player.r + b.r)) {
+      damagePlayer(b.dmg, b.vx, b.vy);
+      bulletImpact(b, '#b02020');
+      dead = true;
+    }
+    if (dead) ebullets.splice(i, 1);
+  }
+}
+
+function bulletImpact(b, col) {
+  const a = Math.atan2(-b.vy, -b.vx);
+  for (let i = 0; i < 4; i++) {
+    const sa = a + rnd(-0.8, 0.8), s = rnd(30, 150);
+    spawnPart({ x: b.x, y: b.y, vx: Math.cos(sa) * s, vy: Math.sin(sa) * s, life: rnd(0.08, 0.22), r: rnd(1, 2.2), col });
+  }
+}
+
+function drawBullets() {
+  for (let i = 0; i < bullets.length; i++) drawTracer(bullets[i], '#ffe89a', '#fff6d0');
+  for (let i = 0; i < ebullets.length; i++) drawTracer(ebullets[i], '#ff9a5a', '#ffd0a0');
+}
+function drawTracer(b, col, core) {
+  const l = Math.hypot(b.vx, b.vy) || 1;
+  const ux = b.vx / l, uy = b.vy / l;
+  ctx.strokeStyle = col;
+  ctx.lineWidth = b.r * 1.6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(b.x - ux * b.len, b.y - uy * b.len);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+  ctx.strokeStyle = core;
+  ctx.lineWidth = b.r * 0.7;
+  ctx.beginPath();
+  ctx.moveTo(b.x - ux * b.len * 0.5, b.y - uy * b.len * 0.5);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+
+/* ------------------------------------------------------------ player firing */
+function muzzlePos(o, back) {
+  const d = (back === undefined ? o.r * 1.9 : back);
+  return { x: o.x + Math.cos(o.aim) * d, y: o.y + Math.sin(o.aim) * d };
+}
+
+function playerFire(dt) {
+  if (player.dead) return;
+  const w = player.weapon;
+  if (!mouse.down) return;
+  if (player.cool > 0) return;
+  if (!w.infinite && player.ammo <= 0) { setWeapon('rifle'); return; }
+
+  const m = muzzlePos(player);
+  if (w.key === 'flame') {
+    fireFlame(m);
+    noiseAlert(300);
+    player.ammo -= 1;
+    player.cool = w.rate;
+    if (player.ammo <= 0) setWeapon('rifle');
+    return;
+  }
+  if (w.key === 'spread') {
+    for (let i = 0; i < w.pellets; i++) {
+      const t = (i / (w.pellets - 1)) - 0.5;
+      const a = player.aim + t * w.arc + rnd(-w.spr, w.spr);
+      spawnBullet(bullets, m.x, m.y, a, w.speed * rnd(0.9, 1.08), w.dmg, '#ffe89a', { life: 0.55, r: 2.0, len: 8 });
+    }
+  } else {
+    spawnBullet(bullets, m.x, m.y, player.aim + rnd(-w.spr, w.spr), w.speed, w.dmg, '#ffe89a', { life: 1.4, r: 2.3, len: 11 });
+  }
+  if (!w.infinite) player.ammo -= 1;
+  noiseAlert(820);
+  player.cool = w.rate;
+  player.muzzle = 0.06;
+  addShake(w.kick);
+  ejectCasing(player);
+  puffSmoke(m.x, m.y, 1, 'rgba(150,145,130,0.4)', 25);
+  if (player.ammo <= 0 && !w.infinite) setWeapon('rifle');
+}
+
+function ejectCasing(o) {
+  const a = o.aim + (Math.random() < 0.5 ? 1.5 : 1.7);
+  const s = rnd(60, 130);
+  spawnPart({
+    x: o.x + Math.cos(o.aim) * o.r, y: o.y + Math.sin(o.aim) * o.r,
+    vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+    life: rnd(0.5, 0.9), r: 1.9, col: '#c8a63c', type: 'casing',
+    drag: 5, rot: rnd(0, TAU), vr: rnd(-20, 20)
+  });
+}
+
+function setWeapon(key) {
+  const w = WEAPONS[key];
+  player.weapon = w;
+  player.ammo = w.infinite ? Infinity : w.ammo;
+  player.cool = Math.max(player.cool, 0.12);
+}
+function giveWeapon(key) {
+  const w = WEAPONS[key];
+  if (player.weapon.key === key && !w.infinite) player.ammo = Math.min(w.ammo * 2, player.ammo + w.ammo);
+  else setWeapon(key);
+  hudFlash = 0.7;
+}
+let hudFlash = 0;
+
+
+/* -------------------------------------------------------------- damage */
+function damagePlayer(dmg, dx, dy) {
+  if (player.dead || player.iframe > 0) return;
+  player.hp -= dmg;
+  player.hurt = 0.35;
+  player.iframe = 0.12;
+  hurtFlash = Math.min(0.62, hurtFlash + 0.4);
+  addShake(2.2 + dmg * 0.12);
+  burstBlood(player.x, player.y, dx || 0, dy || 1, 4);
+  if (player.hp <= 0) killPlayer();
+}
+let hurtFlash = 0;
+
+function killPlayer() {
+  player.hp = 0;
+  player.dead = true;
+  addShake(16);
+  burstBlood(player.x, player.y, 0, 1, 26);
+  burstDebris(player.x, player.y, 10, '#5c6b3a');
+  addDecal({
+    type: 'body', x: player.x, y: player.y, r: player.r, rot: player.aim,
+    bodyCol: '#4a5730', legCol: '#3a4426', helmCol: '#68753f', a: 1
+  });
+  deathTimer = 0;
+  state = ST.DEAD;
+}
+let deathTimer = 0;
+
+function damageEnemy(e, dmg, dx, dy) {
+  if (e.dead) return;
+  hitMark = 0.16;
+  const d = dmg * (e.armour ? (1 - e.armour) : 1);
+  e.hp -= d;
+  e.flash = 0.09;
+  e.stun = Math.max(e.stun || 0, 0.09);
+  const l = Math.hypot(dx || 0, dy || 0) || 1;
+  e.kx = (dx || 0) / l * (e.heavy ? 12 : 42);
+  e.ky = (dy || 0) / l * (e.heavy ? 12 : 42);
+  burstBlood(e.x, e.y, dx || 0, dy || 0, 3);
+  if (e.hp <= 0) killEnemy(e, dx, dy);
+}
+
+function killEnemy(e, dx, dy) {
+  e.dead = true;
+  player.kills++;
+  rings.push({ x: e.x, y: e.y, r: e.r * 0.9, life: 0.28, max: 0.28, grow: e.heavy ? 150 : 90 });
+  burstBlood(e.x, e.y, dx || 0, dy || 1, 14);
+  burstDebris(e.x, e.y, 5, e.bodyCol);
+  addDecal({
+    type: 'body', x: e.x, y: e.y, r: e.r, rot: Math.atan2(dy || 1, dx || 0),
+    bodyCol: e.corpseCol || e.bodyCol, legCol: e.legCol, helmCol: e.helmCol, a: 1
+  });
+  addShake(e.heavy ? 6 : 1.4);
+  if (e.heavy) spawnPickup(e.x + rnd(-8, 8), e.y + rnd(-8, 8), 'med');
+  if (e.heavy) {
+    puffSmoke(e.x, e.y, 10, 'rgba(90,80,70,0.6)', 70);
+    addDecal({ type: 'scorch', x: e.x, y: e.y, r: 20, rot: rnd(0, TAU), col: '#151208', a: 0.4 });
+  }
+}
+
+/* ------------------------------------------------------------------ enemies */
+const ETYPE = {
+  grunt: {
+    key: 'grunt', hp: 34, speed: 74, r: 11, range: 380, sight: 560,
+    burst: 3, burstGap: 0.13, cool: [1.2, 2.1], spr: 0.115, bspd: 330, dmg: 8,
+    bodyCol: '#4d5563', legCol: '#3b4350', packCol: '#333944', armCol: '#5b6472',
+    helmCol: '#6b7686', corpseCol: '#3e4550', markCol: '#c8342a',
+    weaponSprite: 'rifle', score: 1
+  },
+  // entrenched: never leaves its position, but lays down a lot of fire
+  gunner: {
+    key: 'gunner', hp: 52, speed: 52, r: 12, range: 520, sight: 680,
+    burst: 6, burstGap: 0.09, cool: [1.7, 2.7], spr: 0.16, bspd: 400, dmg: 7,
+    entrenched: true,
+    bodyCol: '#3f4a44', legCol: '#333c38', packCol: '#2b3230', armCol: '#4c5a53',
+    helmCol: '#5d6d64', corpseCol: '#333c38', markCol: '#e0a428',
+    weaponSprite: 'lmg', score: 2
+  },
+  // armoured bruiser: walks straight at you and swings
+  heavy: {
+    key: 'heavy', hp: 190, speed: 52, r: 15, range: 64, sight: 760,
+    burst: 0, burstGap: 0, cool: [1, 1], spr: 0, bspd: 0, dmg: 22,
+    melee: true, heavy: true, armour: 0.40,
+    bodyCol: '#33363c', legCol: '#292c31', packCol: '#232629', armCol: '#3d4148',
+    helmCol: '#4a4f57', corpseCol: '#2a2d32', markCol: '#d03018',
+    weaponSprite: 'heavy', score: 4
+  }
+};
+
+function spawnEnemy(type, x, y) {
+  const t = ETYPE[type];
+  const e = {
+    type, t, x, y, r: t.r, hp: t.hp, maxHp: t.hp,
+    speed: t.speed, aim: Math.PI / 2, faceLeg: Math.PI / 2,
+    walk: rnd(0, TAU), moving: false, flash: 0, stun: 0,
+    kx: 0, ky: 0, cool: rnd(0.4, 1.6), shots: 0, burstT: 0,
+    dead: false, awake: false, burn: 0, burnSrc: 0,
+    bodyCol: t.bodyCol, legCol: t.legCol, packCol: t.packCol,
+    armCol: t.armCol, helmCol: t.helmCol, corpseCol: t.corpseCol,
+    markCol: t.markCol || 'rgba(0,0,0,0.25)', weaponSprite: t.weaponSprite,
+    armour: t.armour || 0, heavy: !!t.heavy, armored: !!t.heavy,
+    home: { x, y }, strafe: Math.random() < 0.5 ? 1 : -1, reTarget: rnd(0, 1),
+    tx: x, ty: y, hasTarget: false, sees: false,
+    swing: 0, swingHit: 0, swung: false, muzzle: 0,
+    // --- knowledge of the player, and what to do when that knowledge is stale
+    lx: x, ly: y + 200,        // last known player position
+    known: 0,                  // >0 while the last-known position is worth acting on
+    blind: 0,                  // seconds since the player was last actually visible
+    patience: rnd(1.1, 2.2),   // how long this one tolerates being stonewalled
+    mode: 'fight', modeT: 0,   // fight | flank | assault
+    navWp: null, navT: 0, navCd: 0,  // committed detour waypoint for routing round cover
+    nade: rnd(2.5, 6),         // grenade cooldown
+    alert: 0
+  };
+  enemies.push(e);
+  return e;
+}
+
+function updateEnemies(dt) {
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (e.dead) { enemies.splice(i, 1); continue; }
+    if (e.flash > 0) e.flash -= dt;
+    if (e.stun > 0) e.stun -= dt;
+    if (e.muzzle > 0) e.muzzle -= dt;
+
+    const d = dist(e.x, e.y, player.x, player.y);
+    if (!e.awake && d < e.t.sight + 220) { e.awake = true; e.alert = 1.1; }
+    if (e.alert > 0) e.alert -= dt;
+    if (!e.awake) continue;
+    if (d > 1500) continue;   // far off-screen enemies idle to keep things cheap
+
+    updateBurn(e, dt);
+    if (e.dead) { enemies.splice(i, 1); continue; }
+
+    // knockback impulse decays fast
+    if (e.kx || e.ky) {
+      moveCircle(e, e.kx * dt, e.ky * dt);
+      const k = Math.exp(-9 * dt);
+      e.kx *= k; e.ky *= k;
+      if (Math.abs(e.kx) < 1) e.kx = 0;
+      if (Math.abs(e.ky) < 1) e.ky = 0;
+    }
+
+    enemyAI(e, dt, d);
+    depenetrate(e);
+
+    const ax = (e.sees || e.known <= 0) ? player.x : e.lx;
+    const ay = (e.sees || e.known <= 0) ? player.y : e.ly;
+    e.aim = approachAngle(e.aim, Math.atan2(ay - e.y, ax - e.x), dt * 6.5);
+    if (e.moving) e.walk += dt * 10; else e.walk += dt * 2;
+    e.x = clamp(e.x, e.r, WORLD.w - e.r);
+    e.y = clamp(e.y, e.r, WORLD.h - e.r);
+  }
+}
+
+function updateBurn(e, dt) {
+  if (e.burn > 0) {
+    e.burn -= dt;
+    e.hp -= 17 * dt;
+    if (Math.random() < dt * 26) {
+      spawnPart({ x: e.x + rnd(-6, 6), y: e.y + rnd(-6, 6), vx: rnd(-12, 12), vy: rnd(-30, -10), life: rnd(0.2, 0.45), r: rnd(2, 5), col: '#ff8a20', type: 'flame', drag: 2, grow: 6 });
+    }
+    if (e.hp <= 0) killEnemy(e, 0, 1);
+  }
+}
+
+// Steering: seek a point, slide around obstacles, keep clear of other enemies.
+function enemySteer(e, dt, tx, ty, speedScale) {
+  let dx = tx - e.x, dy = ty - e.y;
+  const l = Math.hypot(dx, dy) || 1;
+  dx /= l; dy /= l;
+  const sep = separation(e);
+  dx += sep.x * 1.5; dy += sep.y * 1.5;
+  const avoid = avoidSolids(e, dx, dy);
+  dx += avoid.x; dy += avoid.y;
+  const l2 = Math.hypot(dx, dy) || 1;
+  dx /= l2; dy /= l2;
+  const sp = e.speed * (speedScale === undefined ? 1 : speedScale) * (e.stun > 0 ? 0.3 : 1);
+  moveCircle(e, dx * sp * dt, dy * sp * dt);
+  e.moving = true;
+  e.faceLeg = approachAngle(e.faceLeg, Math.atan2(dy, dx), dt * 10);
+}
+
+// hard push-apart so bodies never occupy the same patch of ground
+function depenetrate(e) {
+  for (let i = 0; i < enemies.length; i++) {
+    const o = enemies[i];
+    if (o === e || o.dead || !o.awake) continue;
+    const dx = e.x - o.x, dy = e.y - o.y;
+    const rr = (e.r + o.r) * 0.95;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= rr * rr) continue;
+    const d = Math.sqrt(d2) || 0.01;
+    const push = (rr - d) * 0.5;
+    const ux = dx / d, uy = dy / d;
+    e.x += ux * push; e.y += uy * push;
+    o.x -= ux * push; o.y -= uy * push;
+    resolveSolids(e, 0, 0);
+    resolveSolids(o, 0, 0);
+  }
+  // and the player is not a doormat either
+  if (!player.dead) {
+    const dx = e.x - player.x, dy = e.y - player.y;
+    const rr = e.r + player.r;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < rr * rr) {
+      const d = Math.sqrt(d2) || 0.01;
+      const push = (rr - d);
+      e.x += (dx / d) * push * 0.7;
+      e.y += (dy / d) * push * 0.7;
+      resolveSolids(e, 0, 0);
+    }
+  }
+}
+
+function separation(e) {
+  let sx = 0, sy = 0;
+  for (let i = 0; i < enemies.length; i++) {
+    const o = enemies[i];
+    if (o === e || o.dead) continue;
+    const dx = e.x - o.x, dy = e.y - o.y;
+    const d2 = dx * dx + dy * dy;
+    const rad = (e.r + o.r) * 1.9;
+    if (d2 > 0.01 && d2 < rad * rad) {
+      const d = Math.sqrt(d2);
+      const f = (1 - d / rad);
+      sx += (dx / d) * f; sy += (dy / d) * f;
+    }
+  }
+  return { x: sx, y: sy };
+}
+
+/* ------------------------------------------------------------- navigation */
+
+// nearest solid obstacle blocking a segment, or null
+function blockingSolid(x0, y0, x1, y1) {
+  let best = null, bestT = 2;
+  eachObstacle(Math.min(x0, x1) - 4, Math.min(y0, y1) - 4, Math.max(x0, x1) + 4, Math.max(y0, y1) + 4, function (o) {
+    if (!o.solid) return;
+    const t = segRect(x0, y0, x1, y1, o);
+    if (t >= 0 && t < bestT) { bestT = t; best = o; }
+  });
+  return best;
+}
+
+/* Seek a goal, but if a solid sits between us and it, commit to one end of that
+   solid for a beat and walk round it. Plain steering just grinds into the wall
+   forever, which is how five men end up stacked against one sandbag line. */
+function navSteer(e, dt, tx, ty, sc) {
+  if (e.navT > 0) {
+    e.navT -= dt;
+    const w = e.navWp;
+    if (w && e.navT > 0 && dist2(e.x, e.y, w.x, w.y) > 24 * 24) {
+      enemySteer(e, dt, w.x, w.y, sc);
+      return;
+    }
+    e.navT = 0; e.navWp = null;
+  }
+  if (e.navCd > 0) { e.navCd -= dt; enemySteer(e, dt, tx, ty, sc); return; }
+
+  const o = blockingSolid(e.x, e.y, tx, ty);
+  if (o) {
+    // Corners of the obstacle grown by our own radius. Rounding a long wall
+    // usually takes two legs — get to the near corner, then step past the end —
+    // so a corner we are already standing on is not a candidate.
+    const pad = e.r + 13;
+    const cs = [
+      o.x - pad, o.y - pad, o.x + o.w + pad, o.y - pad,
+      o.x - pad, o.y + o.h + pad, o.x + o.w + pad, o.y + o.h + pad
+    ];
+    let best = null, bestCost = 1e18;
+    for (let i = 0; i < cs.length; i += 2) {
+      const cx = cs[i], cy = cs[i + 1];
+      if (cx < 24 || cy < 24 || cx > WORLD.w - 24 || cy > WORLD.h - 24) continue;
+      if (dist2(e.x, e.y, cx, cy) < (pad * 0.8) * (pad * 0.8)) continue;
+      if (pointInSolid(cx, cy, e.r * 0.6)) continue;
+      if (blockingSolid(e.x, e.y, cx, cy)) continue;      // must be walkable now
+      const cost = dist(e.x, e.y, cx, cy) + dist(cx, cy, tx, ty);
+      if (cost < bestCost) { bestCost = cost; best = { x: cx, y: cy }; }
+    }
+    if (best) {
+      e.navWp = best; e.navT = rnd(0.7, 1.4);
+      enemySteer(e, dt, best.x, best.y, sc);
+      return;
+    }
+    e.navCd = 0.35;                                        // nothing found; do not thrash
+  }
+  enemySteer(e, dt, tx, ty, sc);
+}
+
+/* ------------------------------------------------------------------- cover */
+
+/* Firing positions hugging the shielded face of a solid, spread along its
+   length and round its corners. Corners matter: a soldier who cannot see out
+   cannot shoot out, so a slot with a line on the player is worth far more than
+   a hole to hide in. */
+const slotBuf = [];
+function coverSlots(o, e) {
+  const s = slotBuf;
+  s.length = 0;
+  const dx = o.cx - player.x, dy = o.cy - player.y;
+  const pad = e.r + 7;
+  if (Math.abs(dx) > Math.abs(dy)) {
+    const sx = o.cx + (dx > 0 ? o.hx + pad : -(o.hx + pad));
+    s.push(sx, o.cy, sx, o.cy - (o.hy + pad), sx, o.cy + (o.hy + pad));
+    if (o.hy > 24) s.push(sx, o.cy - o.hy * 0.6, sx, o.cy + o.hy * 0.6);
+  } else {
+    const sy = o.cy + (dy > 0 ? o.hy + pad : -(o.hy + pad));
+    s.push(o.cx, sy, o.cx - (o.hx + pad), sy, o.cx + (o.hx + pad), sy);
+    if (o.hx > 24) s.push(o.cx - o.hx * 0.6, sy, o.cx + o.hx * 0.6, sy);
+  }
+  return s;
+}
+
+// how many other soldiers already stand on, or are walking to, this patch
+function slotCrowding(e, x, y) {
+  let c = 0;
+  for (let i = 0; i < enemies.length; i++) {
+    const o = enemies[i];
+    if (o === e || o.dead || !o.awake) continue;
+    if (dist2(o.x, o.y, x, y) < 56 * 56) c++;
+    if (o.hasTarget && dist2(o.tx, o.ty, x, y) < 56 * 56) c++;
+  }
+  return c;
+}
+
+function findCover(e, advance, needLos) {
+  const midx = advance ? lerp(e.x, player.x, 0.45) : e.x;
+  const midy = advance ? lerp(e.y, player.y, 0.45) : e.y;
+  const reach = advance ? 360 : 240;
+  const dToPlayer = dist(e.x, e.y, player.x, player.y);
+  const want = e.t.range * 0.62;
+  let best = null, bestScore = -1e9, seen = 0;
+  eachObstacle(midx - reach, midy - reach, midx + reach, midy + reach, function (o) {
+    if (!o.blocks || o.kind === 'barrel') return;
+    if (++seen > 8) return true;
+    const s = coverSlots(o, e);
+    for (let i = 0; i < s.length; i += 2) {
+      const sx = s[i], sy = s[i + 1];
+      if (sx < 40 || sy < 40 || sx > WORLD.w - 40 || sy > WORLD.h - 40) continue;
+      if (pointInSolid(sx, sy, e.r * 0.7)) continue;
+      const dEnemy = dist(e.x, e.y, sx, sy);
+      if (dEnemy > reach) continue;
+      const dPl = dist(sx, sy, player.x, player.y);
+      if (dPl < 70) continue;
+      const shot = losClear(sx, sy, player.x, player.y);
+      if (needLos && !shot) continue;
+      let score = -dEnemy * 0.5 - Math.abs(dPl - want) * 0.4;
+      if (advance) score += (dToPlayer - dPl) * 1.2;
+      if (shot) score += 300;                                   // a firing slot
+      score -= slotCrowding(e, sx, sy) * 170;                   // no stacking up
+      score += Math.random() * 70;
+      if (score > bestScore) { bestScore = score; best = { x: sx, y: sy }; }
+    }
+  });
+  return best;
+}
+
+function pickCover(e, advance) {
+  const c = findCover(e, advance);
+  if (c) { e.tx = c.x; e.ty = c.y; e.hasTarget = true; }
+  else { e.hasTarget = false; }
+  e.reTarget = rnd(1.0, 2.2);
+}
+
+/* A standing spot with a clean line onto the player's last known position,
+   swung well off the bearing we are currently stuck on. */
+function findFlank(e) {
+  const px = e.known > 0 ? e.lx : player.x, py = e.known > 0 ? e.ly : player.y;
+  const want = clamp(e.t.range * 0.55, 130, 300);
+  const base = Math.atan2(e.y - py, e.x - px);
+  let best = null, bestScore = -1e9;
+  for (let i = 1; i <= 6; i++) {
+    const off = (0.5 + i * 0.29) * e.strafe;
+    const a = base + off;
+    const sx = clamp(px + Math.cos(a) * want, 50, WORLD.w - 50);
+    const sy = clamp(py + Math.sin(a) * want, 50, WORLD.h - 50);
+    if (pointInSolid(sx, sy, e.r + 4)) continue;
+    if (!losClear(sx, sy, px, py)) continue;
+    const score = -dist(e.x, e.y, sx, sy) - Math.abs(off) * 26 - slotCrowding(e, sx, sy) * 90;
+    if (score > bestScore) { bestScore = score; best = { x: sx, y: sy }; }
+  }
+  return best;
+}
+
+/* ---------------------------------------------------------------- enemy AI */
+
+function enemyAI(e, dt, d) {
+  e.moving = false;
+  const see = d < e.t.sight && losClear(e.x, e.y, player.x, player.y);
+  e.sees = see;
+  if (see) {
+    e.lx = player.x; e.ly = player.y; e.known = 5; e.blind = 0;
+    if (e.mode !== 'fight') { e.mode = 'fight'; e.modeT = 0; e.navT = 0; e.hasTarget = false; }
+  } else {
+    e.blind += dt;
+    if (e.known > 0) e.known -= dt;
+  }
+  if (e.t.melee) { heavyAI(e, dt, d, see); return; }
+
+  if (e.reTarget > 0) e.reTarget -= dt;
+  if (e.nade > 0) e.nade -= dt;
+
+  // set alight: a burning man does not hold a firing line
+  if (e.burn > 0 && !e.heavy) {
+    e.burstT = 0; e.shots = 0;
+    e.cool = Math.max(e.cool, 0.45);
+    e.navT = 0; e.hasTarget = false;
+    const a = Math.atan2(e.y - player.y, e.x - player.x) + Math.sin(e.walk * 2.6) * 0.9;
+    enemySteer(e, dt, e.x + Math.cos(a) * 90, e.y + Math.sin(a) * 90, 1.3);
+    return;
+  }
+
+  // ---- shooting
+  if (e.burstT > 0) {
+    e.burstT -= dt;
+    if (e.burstT <= 0 && e.shots > 0) {
+      enemyShoot(e);
+      e.shots--;
+      e.burstT = e.shots > 0 ? e.t.burstGap : 0;
+      if (e.shots <= 0) e.cool = rnd(e.t.cool[0], e.t.cool[1]);
+    }
+    // shuffle sideways while firing rather than posing as a target
+    if (!e.t.entrenched) {
+      const a = Math.atan2(player.y - e.y, player.x - e.x) + Math.PI / 2 * e.strafe;
+      enemySteer(e, dt, e.x + Math.cos(a) * 60, e.y + Math.sin(a) * 60, 0.3);
+    }
+    return;
+  }
+  if (e.cool > 0) e.cool -= dt;
+  else if (see && d < e.t.range) { e.shots = e.t.burst; e.burstT = 0.001; return; }
+  else if (!see && e.known > 0 && e.blind < 1.3 && d < e.t.range) {
+    // suppression: keep hosing where he was. Chews through his cover, and the
+    // odd round finds the gap.
+    e.shots = Math.max(1, e.t.burst - 1); e.burstT = 0.001; return;
+  }
+
+  // ---- grenades: the answer to a man who will not come out from behind a wall
+  if (!see && e.known > 0 && e.blind > 0.8 && e.nade <= 0 &&
+      d > 95 && d < 430 && grenades.length < 3 && !nadeIncoming(e.lx, e.ly)) {
+    throwGrenade(e);
+    e.nade = rnd(5, 9);
+    return;
+  }
+
+  if (e.t.entrenched) { gunnerMove(e, dt, d, see); return; }
+
+  // ---- stonewalled grunts stop playing peekaboo and go round
+  if (!see) {
+    e.modeT -= dt;
+    if (e.mode === 'fight') {
+      if (e.blind > e.patience) {
+        e.mode = 'flank'; e.modeT = rnd(2.6, 4.2);
+        e.hasTarget = false; e.navT = 0; e.reTarget = 0;
+        e.strafe = Math.random() < 0.5 ? 1 : -1;
+      }
+    } else if (e.modeT <= 0) {
+      // alternate: swing wide, then just come straight at him
+      e.mode = e.mode === 'flank' ? 'assault' : 'flank';
+      e.modeT = e.mode === 'flank' ? rnd(2.6, 4.2) : rnd(3.5, 6);
+      e.hasTarget = false; e.navT = 0; e.reTarget = 0;
+    }
+  }
+
+  const want = e.t.range * 0.62;
+  const reloading = e.cool > 0.3;
+  const kx = e.known > 0 ? e.lx : player.x, ky = e.known > 0 ? e.ly : player.y;
+
+  if (e.mode === 'assault') {
+    e.hasTarget = false;
+    if (dist2(e.x, e.y, kx, ky) > 44 * 44) navSteer(e, dt, kx, ky, 1.2);
+    return;
+  }
+
+  if (e.mode === 'flank') {
+    if (e.reTarget <= 0 || !e.hasTarget) {
+      const f = findFlank(e);
+      if (f) { e.tx = f.x; e.ty = f.y; e.hasTarget = true; e.reTarget = rnd(1.0, 1.8); }
+      else { e.mode = 'assault'; e.modeT = rnd(3, 5); return; }
+    }
+    if (dist2(e.x, e.y, e.tx, e.ty) > 28 * 28) { navSteer(e, dt, e.tx, e.ty, 1.1); return; }
+    e.hasTarget = false; e.reTarget = 0;
+    return;
+  }
+
+  // fight: bound from cover to cover instead of walking down open ground
+  if (e.reTarget <= 0) pickCover(e, !see || d > want + 40);
+
+  if (e.hasTarget && dist2(e.x, e.y, e.tx, e.ty) > 20 * 20) {
+    navSteer(e, dt, e.tx, e.ty, reloading ? 1 : 0.9);
+    return;
+  }
+  e.hasTarget = false;
+  if (see && d > want + 40) navSteer(e, dt, player.x, player.y, 0.85);
+  else if (see && d < want - 90) enemySteer(e, dt, e.x * 2 - player.x, e.y * 2 - player.y, 0.7);
+  else if (!see && e.known > 0) navSteer(e, dt, kx, ky, 0.9);
+}
+
+/* Gunners hold their emplacement, but an emplacement with no line on the enemy
+   is a hole in the ground: after long enough blind they displace to a new one. */
+function gunnerMove(e, dt, d, see) {
+  const home = dist(e.x, e.y, e.home.x, e.home.y);
+  if (see || d > e.t.sight) {
+    if (home > 30) enemySteer(e, dt, e.home.x, e.home.y, see ? 0.5 : 0.7);
+    return;
+  }
+  if (e.blind > 2.8) {
+    if (e.reTarget <= 0 || !e.hasTarget) {
+      // an emplacement is only worth moving to if it can actually see him
+      const c = findCover(e, true, true) || findFlank(e) || findCover(e, true);
+      if (c) { e.tx = c.x; e.ty = c.y; e.hasTarget = true; e.reTarget = rnd(1.2, 2.2); }
+      else e.reTarget = 0.7;
+    }
+    if (e.hasTarget) {
+      if (dist2(e.x, e.y, e.tx, e.ty) > 24 * 24) { navSteer(e, dt, e.tx, e.ty, 0.85); return; }
+      e.home.x = e.x; e.home.y = e.y; e.hasTarget = false; e.blind = 0;
+    }
+    return;
+  }
+  if (e.reTarget <= 0) {
+    const a = Math.atan2(e.ly - e.y, e.lx - e.x) + Math.PI / 2 * e.strafe;
+    e.tx = e.home.x + Math.cos(a) * 60; e.ty = e.home.y + Math.sin(a) * 60;
+    e.hasTarget = true; e.reTarget = rnd(0.8, 1.6); e.strafe *= -1;
+  }
+  if (e.hasTarget) enemySteer(e, dt, e.tx, e.ty, 0.8);
+}
+
+/* Heavies: no gun. They walk through fire and swing at melee range. */
+function heavyAI(e, dt, d, see) {
+  if (e.swing > 0) {
+    e.swing -= dt;
+    if (e.swing <= 0.001) e.swing = 0;
+    if (!e.swung && e.swing < e.swingHit) {
+      e.swung = true;
+      addShake(3);
+      if (dist(e.x, e.y, player.x, player.y) < e.r + player.r + 26) {
+        damagePlayer(e.t.dmg, player.x - e.x, player.y - e.y);
+      }
+      burstDebris(e.x + Math.cos(e.aim) * e.r, e.y + Math.sin(e.aim) * e.r, 4, '#6a6058');
+    }
+    return;
+  }
+  if (e.cool > 0) e.cool -= dt;
+  if (d < e.r + player.r + 16 && e.cool <= 0) {
+    e.swing = 0.42; e.swingHit = 0.20; e.swung = false;
+    e.cool = 0.95;
+    return;
+  }
+  if (d < e.t.sight + 500) {
+    // ignore cover as protection, but route around it rather than into it
+    navSteer(e, dt, player.x, player.y, d < 260 ? 1.15 : 1);
+  }
+}
+
+function enemyShoot(e) {
+  const m = muzzlePos(e);
+  // blind fire goes at the last known position, and goes wide
+  const tx = e.sees ? player.x : e.lx, ty = e.sees ? player.y : e.ly;
+  const spr = e.sees ? e.t.spr : e.t.spr * 2.1;
+  const a = Math.atan2(ty - e.y, tx - e.x) + rnd(-spr, spr);
+  spawnBullet(ebullets, m.x, m.y, a, e.t.bspd, e.t.dmg, '#ff9a5a', { life: 2.2, r: 2.4, len: 9 });
+  e.muzzle = 0.06;
+  ejectCasing(e);
+  puffSmoke(m.x, m.y, 1, 'rgba(150,145,130,0.35)', 20);
+}
+
+/* ---------------------------------------------------------------- grenades
+   A thrown grenade arcs over cover, which is the one thing that makes camping
+   behind a sandbag wall a decision rather than a solution. It is telegraphed by
+   a shrinking marker on the ground so it is always dodgeable, and it is just as
+   lethal to the men who threw it. */
+// one grenade at a time on any given patch: a carpet is not a threat you can read
+function nadeIncoming(x, y) {
+  for (let i = 0; i < grenades.length; i++) {
+    if (dist2(grenades[i].tx, grenades[i].ty, x, y) < 150 * 150) return true;
+  }
+  return false;
+}
+
+function throwGrenade(e) {
+  const tx = clamp(e.lx + rnd(-30, 30), 30, WORLD.w - 30);
+  const ty = clamp(e.ly + rnd(-30, 30), 30, WORLD.h - 30);
+  const flight = clamp(dist(e.x, e.y, tx, ty) / 340, 0.5, 1.3);
+  grenades.push({
+    sx: e.x, sy: e.y, x: e.x, y: e.y, tx: tx, ty: ty, z: 0,
+    t: 0, dur: flight, fuse: flight + rnd(0.5, 0.85), spin: rnd(0, TAU)
+  });
+  e.aim = Math.atan2(ty - e.y, tx - e.x);
+}
+
+function updateGrenades(dt) {
+  for (let i = grenades.length - 1; i >= 0; i--) {
+    const g = grenades[i];
+    g.t += dt;
+    const k = clamp(g.t / g.dur, 0, 1);
+    g.x = lerp(g.sx, g.tx, k);
+    g.y = lerp(g.sy, g.ty, k);
+    g.z = Math.sin(k * Math.PI) * 30;
+    g.spin += dt * 13;
+    if (k < 1 && Math.random() < dt * 22) {
+      spawnPart({ x: g.x, y: g.y - g.z, vx: rnd(-8, 8), vy: rnd(-14, 2), life: rnd(0.3, 0.6), r: rnd(1.6, 3), col: 'rgba(140,136,124,0.4)', type: 'smoke', drag: 2, grow: 12 });
+    }
+    if (g.t >= g.fuse) {
+      explode(g.x, g.y, 108, 34);
+      grenades.splice(i, 1);
+    }
+  }
+}
+
+function drawGrenades() {
+  for (let i = 0; i < grenades.length; i++) {
+    const g = grenades[i];
+    const k = clamp((g.fuse - g.t) / g.fuse, 0, 1);
+    const rr = 22 + k * 74;
+    const pulse = 0.55 + 0.45 * Math.sin(g.t * 22);
+    ctx.save();
+    // blast footprint: a hard ring that closes in, so it reads as a countdown
+    ctx.globalAlpha = 0.07 + 0.05 * pulse;
+    ctx.fillStyle = '#ff4a10';
+    ctx.beginPath(); ctx.arc(g.tx, g.ty, rr, 0, TAU); ctx.fill();
+    ctx.setLineDash([9, 7]);
+    ctx.lineDashOffset = -g.t * 40;
+    ctx.globalAlpha = 0.5 + 0.5 * pulse;
+    ctx.strokeStyle = '#ff9a30';
+    ctx.lineWidth = 3.5;
+    ctx.beginPath(); ctx.arc(g.tx, g.ty, rr, 0, TAU); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = '#ffe08a';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(g.tx, g.ty, 5, 0, TAU); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(g.tx - 11, g.ty); ctx.lineTo(g.tx - 6, g.ty);
+    ctx.moveTo(g.tx + 6, g.ty); ctx.lineTo(g.tx + 11, g.ty);
+    ctx.moveTo(g.tx, g.ty - 11); ctx.lineTo(g.tx, g.ty - 6);
+    ctx.moveTo(g.tx, g.ty + 6); ctx.lineTo(g.tx, g.ty + 11);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = 'rgba(0,0,0,0.34)';
+    ctx.beginPath(); ctx.ellipse(g.x, g.y + 2, 5, 3.2, 0, 0, TAU); ctx.fill();
+    ctx.save();
+    ctx.translate(g.x, g.y - g.z);
+    ctx.rotate(g.spin);
+    ctx.fillStyle = '#454e3c';
+    roundRect(-4, -5.5, 8, 11, 2.6); ctx.fill();
+    ctx.fillStyle = '#282c22';
+    ctx.fillRect(-4, -1.6, 8, 2.2);
+    ctx.fillStyle = '#7d8a4e';
+    ctx.fillRect(-1, -7, 2, 2.5);
+    ctx.restore();
+    ctx.fillStyle = ((g.t * 11) | 0) % 2 ? '#ff3a20' : '#5a1408';
+    ctx.beginPath(); ctx.arc(g.x + 3, g.y - g.z - 5, 1.7, 0, TAU); ctx.fill();
+  }
+}
+
+/* gunfire gives your position away: a camper who keeps shooting keeps telling
+   the whole valley exactly where he is */
+let noiseT = 0;
+function noiseAlert(loud) {
+  if (noiseT > 0) return;
+  noiseT = 0.22;
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i];
+    if (e.dead) continue;
+    if (dist2(e.x, e.y, player.x, player.y) > loud * loud) continue;
+    if (!e.awake) { e.awake = true; e.alert = 1.1; }
+    e.lx = player.x + rnd(-26, 26);
+    e.ly = player.y + rnd(-26, 26);
+    e.known = 5;
+  }
+}
+
+function drawEnemies() {
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i];
+    if (e.x < cam.x - 60 || e.x > cam.x + viewW() + 60 || e.y < cam.y - 60 || e.y > cam.y + viewH() + 60) continue;
+    drawSoldier(e);
+    if (e.swing > 0) drawSwing(e);
+    if (e.muzzle > 0) drawMuzzleFlash(e);
+    if (e.burn > 0) drawBurning(e);
+    if (e.hp < e.maxHp && e.maxHp > 40) drawEnemyHealth(e);
+    if (e.alert > 0) {
+      const t = clamp(e.alert / 1.1, 0, 1);
+      ctx.globalAlpha = clamp(t * 1.6, 0, 1);
+      ctx.fillStyle = '#ffd23a';
+      ctx.font = 'bold 15px "Courier New",monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('!', e.x, e.y - e.r - 12 - (1 - t) * 5);
+      ctx.textAlign = 'left';
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+// melee telegraph: a red arc winds up, then a white slash on the hit frame
+function drawSwing(e) {
+  const t = 1 - clamp(e.swing / 0.42, 0, 1);
+  ctx.save();
+  ctx.translate(e.x, e.y);
+  ctx.rotate(e.aim);
+  const reach = e.r + 26;
+  if (!e.swung) {
+    ctx.strokeStyle = 'rgba(230,60,30,' + (0.25 + t * 0.5).toFixed(2) + ')';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(0, 0, reach, -0.85, 0.85);
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = 'rgba(255,245,220,' + (0.9 - t * 0.6).toFixed(2) + ')';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(0, 0, reach * 0.92, -0.9, 0.9);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawEnemyHealth(e) {
+  const w = e.r * 2.2, h = 3;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w, h);
+  ctx.fillStyle = '#d04a2a';
+  ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w * clamp(e.hp / e.maxHp, 0, 1), h);
+}
+function drawBurning(e) {
+  ctx.globalAlpha = 0.5 + Math.sin(time * 40 + e.x) * 0.2;
+  ctx.fillStyle = '#ff7a18';
+  ctx.beginPath(); ctx.arc(e.x, e.y, e.r * 1.15, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawMuzzleFlash(o) {
+  const m = muzzlePos(o, o.r * 2.1);
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  ctx.rotate(o.aim);
+  ctx.globalAlpha = 0.95;
+  ctx.fillStyle = '#fff4c0';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(13, -5.5); ctx.lineTo(19, 0); ctx.lineTo(13, 5.5);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(255,190,70,0.75)';
+  ctx.beginPath(); ctx.arc(3, 0, 6.5, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/* -------------------------------------------------------------- game states */
+const ST = { TITLE: 0, PLAY: 1, DEAD: 2, WIN: 3 };
+let state = ST.TITLE;
+let time = 0;
+
+// Title -> play -> death/victory -> a completely clean restart.
+function advanceState() {
+  if (state === ST.TITLE) { startGame(); return; }
+  if ((state === ST.DEAD || state === ST.WIN) && deathTimer > 0.7) { startGame(); return; }
+}
+function onKeyPress(code) {
+  if (code === 'Space' || code === 'Enter' || code === 'KeyR') advanceState();
+}
+function onClick() { advanceState(); }
+
+/* ============================================================================
+   TERRAIN: cover that blocks movement, bullets and sight
+   ========================================================================== */
+let obstacles = [];
+const OCELL = 220;
+let ogrid = null, ogridW = 0, ogridH = 0;
+let oStamp = null, oStampId = 0;
+
+function addObstacle(o) {
+  o.dead = false;
+  o.hx = o.w / 2; o.hy = o.h / 2;
+  o.cx = o.x + o.hx; o.cy = o.y + o.hy;
+  o.shade = rnd(-0.06, 0.06);
+  o.rot = rnd(0, TAU);
+  obstacles.push(o);
+  return o;
+}
+
+function buildObstacleGrid() {
+  ogridW = Math.ceil(WORLD.w / OCELL);
+  ogridH = Math.ceil(WORLD.h / OCELL);
+  ogrid = new Array(ogridW * ogridH);
+  for (let i = 0; i < ogrid.length; i++) ogrid[i] = null;
+  for (let i = 0; i < obstacles.length; i++) {
+    const o = obstacles[i];
+    const cx0 = clamp(Math.floor(o.x / OCELL), 0, ogridW - 1);
+    const cy0 = clamp(Math.floor(o.y / OCELL), 0, ogridH - 1);
+    const cx1 = clamp(Math.floor((o.x + o.w) / OCELL), 0, ogridW - 1);
+    const cy1 = clamp(Math.floor((o.y + o.h) / OCELL), 0, ogridH - 1);
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const k = cy * ogridW + cx;
+        if (!ogrid[k]) ogrid[k] = [];
+        ogrid[k].push(i);
+      }
+    }
+  }
+  oStamp = new Int32Array(obstacles.length);
+  oStampId = 0;
+}
+
+// visit every live obstacle whose cell overlaps the box, at most once each
+function eachObstacle(x0, y0, x1, y1, fn) {
+  if (!ogrid) return;
+  const cx0 = clamp(Math.floor(x0 / OCELL), 0, ogridW - 1);
+  const cy0 = clamp(Math.floor(y0 / OCELL), 0, ogridH - 1);
+  const cx1 = clamp(Math.floor(x1 / OCELL), 0, ogridW - 1);
+  const cy1 = clamp(Math.floor(y1 / OCELL), 0, ogridH - 1);
+  oStampId++;
+  for (let cy = cy0; cy <= cy1; cy++) {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      const list = ogrid[cy * ogridW + cx];
+      if (!list) continue;
+      for (let i = 0; i < list.length; i++) {
+        const id = list[i];
+        if (oStamp[id] === oStampId) continue;
+        oStamp[id] = oStampId;
+        const o = obstacles[id];
+        if (o.dead) continue;
+        if (fn(o) === true) return;
+      }
+    }
+  }
+}
+
+/* circle vs solid rects: push the entity out along the axis it just moved on */
+function resolveSolids(e, ax, ay) {
+  const r = e.r;
+  eachObstacle(e.x - r - 4, e.y - r - 4, e.x + r + 4, e.y + r + 4, function (o) {
+    if (!o.solid) return;
+    const nx = clamp(e.x, o.x, o.x + o.w);
+    const ny = clamp(e.y, o.y, o.y + o.h);
+    let dx = e.x - nx, dy = e.y - ny;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= r * r) return;
+    if (d2 > 0.0001) {
+      const d = Math.sqrt(d2);
+      const push = r - d;
+      if (ax) { e.x += (dx / d) * push; } else if (ay) { e.y += (dy / d) * push; }
+      else { e.x += (dx / d) * push; e.y += (dy / d) * push; }
+    } else {
+      // centre is inside the rect: eject along the shallowest face
+      const l = e.x - o.x, rr = o.x + o.w - e.x, t = e.y - o.y, b = o.y + o.h - e.y;
+      const m = Math.min(l, rr, t, b);
+      if (m === l) e.x = o.x - r; else if (m === rr) e.x = o.x + o.w + r;
+      else if (m === t) e.y = o.y - r; else e.y = o.y + o.h + r;
+    }
+  });
+}
+
+function pointInSolid(x, y, pad) {
+  pad = pad || 0;
+  let hit = false;
+  eachObstacle(x - pad, y - pad, x + pad, y + pad, function (o) {
+    if (!o.solid) return;
+    if (x >= o.x - pad && x <= o.x + o.w + pad && y >= o.y - pad && y <= o.y + o.h + pad) { hit = true; return true; }
+  });
+  return hit;
+}
+
+/* segment vs AABB (slab method); returns entry t in [0,1] or -1 */
+function segRect(x0, y0, x1, y1, o) {
+  const dx = x1 - x0, dy = y1 - y0;
+  let tmin = 0, tmax = 1;
+  if (Math.abs(dx) < 1e-8) {
+    if (x0 < o.x || x0 > o.x + o.w) return -1;
+  } else {
+    let t1 = (o.x - x0) / dx, t2 = (o.x + o.w - x0) / dx;
+    if (t1 > t2) { const tt = t1; t1 = t2; t2 = tt; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return -1;
+  }
+  if (Math.abs(dy) < 1e-8) {
+    if (y0 < o.y || y0 > o.y + o.h) return -1;
+  } else {
+    let t1 = (o.y - y0) / dy, t2 = (o.y + o.h - y0) / dy;
+    if (t1 > t2) { const tt = t1; t1 = t2; t2 = tt; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return -1;
+  }
+  return tmin;
+}
+
+/* bullets: stop dead at cover, and chip destructible cover on the way */
+function hitsSolid(b) {
+  const x0 = b.px, y0 = b.py, x1 = b.x, y1 = b.y;
+  let best = null, bestT = 2;
+  eachObstacle(Math.min(x0, x1) - 4, Math.min(y0, y1) - 4, Math.max(x0, x1) + 4, Math.max(y0, y1) + 4, function (o) {
+    if (!o.blocks) return;
+    const t = segRect(x0, y0, x1, y1, o);
+    if (t >= 0 && t < bestT) { bestT = t; best = o; }
+  });
+  if (!best) return false;
+  b.x = x0 + (x1 - x0) * bestT;
+  b.y = y0 + (y1 - y0) * bestT;
+  if (best.hp) damageObstacle(best, b.dmg, x1 - x0, y1 - y0);
+  else burstDebris(b.x, b.y, 1, best.chipCol || '#8a8270');
+  return true;
+}
+
+function losClear(x0, y0, x1, y1) {
+  let clear = true;
+  eachObstacle(Math.min(x0, x1) - 4, Math.min(y0, y1) - 4, Math.max(x0, x1) + 4, Math.max(y0, y1) + 4, function (o) {
+    if (!o.blocks) return;
+    if (segRect(x0, y0, x1, y1, o) >= 0) { clear = false; return true; }
+  });
+  return clear;
+}
+
+function damageObstacle(o, dmg, dx, dy) {
+  if (!o.hp || o.dead) return;
+  o.hp -= dmg;
+  o.flash = 0.07;
+  burstDebris(o.cx + rnd(-o.hx, o.hx), o.cy + rnd(-o.hy, o.hy), 2, o.chipCol || '#8a6a3a');
+  if (o.hp <= 0) destroyObstacle(o);
+}
+
+function destroyObstacle(o) {
+  o.dead = true;
+  if (o.kind === 'barrel') {
+    explode(o.cx, o.cy, 96, 46);
+    return;
+  }
+  burstDebris(o.cx, o.cy, 16, o.chipCol || '#8a6a3a');
+  puffSmoke(o.cx, o.cy, 6, 'rgba(120,110,95,0.5)', 60);
+  addShake(3.5);
+  addDecal({ type: 'scorch', x: o.cx, y: o.cy, r: o.hx * 1.1, rot: rnd(0, TAU), col: '#2a2216', a: 0.35 });
+  if (o.drop) spawnPickup(o.cx, o.cy, o.drop);
+}
+
+function explode(x, y, radius, dmg) {
+  addShake(11);
+  rings.push({ x: x, y: y, r: 8, life: 0.42, max: 0.42, grow: radius * 3.4 });
+  addDecal({ type: 'scorch', x, y, r: radius * 0.55, rot: rnd(0, TAU), col: '#120e08', a: 0.6 });
+  for (let i = 0; i < 26; i++) {
+    const a = rnd(0, TAU), s = rnd(60, 420);
+    spawnPart({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.25, 0.7), r: rnd(3, 9), col: '#ffb03a', type: 'flame', drag: 3, grow: 12 });
+  }
+  burstDebris(x, y, 14, '#5a4a30');
+  puffSmoke(x, y, 14, 'rgba(60,55,50,0.65)', 130);
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    const d = dist(e.x, e.y, x, y);
+    if (d < radius) {
+      const f = 1 - d / radius;
+      damageEnemy(e, dmg * f, e.x - x, e.y - y);
+      if (!e.dead) e.burn = Math.max(e.burn, 1.2);
+    }
+  }
+  const pd = dist(player.x, player.y, x, y);
+  if (pd < radius && !player.dead) damagePlayer(dmg * 0.55 * (1 - pd / radius), player.x - x, player.y - y);
+  // chain-react nearby barrels
+  eachObstacle(x - radius, y - radius, x + radius, y + radius, function (o) {
+    if (o.dead || o.kind !== 'barrel') return;
+    if (dist(o.cx, o.cy, x, y) < radius) { o.hp = 0.001; o.fuse = rnd(0.05, 0.2); }
+  });
+}
+
+/* enemy obstacle avoidance: probe ahead, then steer around whatever is there */
+function avoidSolids(e, dx, dy) {
+  const probe = e.r + 26;
+  const px = e.x + dx * probe, py = e.y + dy * probe;
+  let ax = 0, ay = 0;
+  eachObstacle(px - e.r, py - e.r, px + e.r, py + e.r, function (o) {
+    if (!o.solid) return;
+    const nx = clamp(px, o.x, o.x + o.w), ny = clamp(py, o.y, o.y + o.h);
+    const ddx = px - nx, ddy = py - ny;
+    const d2 = ddx * ddx + ddy * ddy;
+    if (d2 < e.r * e.r) {
+      // slide: pick the perpendicular that points away from the obstacle centre
+      const s = (dy * (e.x - o.cx) - dx * (e.y - o.cy)) > 0 ? 1 : -1;
+      ax += -dy * s * 1.7; ay += dx * s * 1.7;
+    }
+  });
+  return { x: ax, y: ay };
+}
+
+function updateObstacles(dt) {
+  for (let i = 0; i < obstacles.length; i++) {
+    const o = obstacles[i];
+    if (o.dead) continue;
+    if (o.flash > 0) o.flash -= dt;
+    if (o.fuse !== undefined) {
+      o.fuse -= dt;
+      if (o.fuse <= 0) destroyObstacle(o);
+    }
+  }
+}
+
+/* ------------------------------------------------------------ terrain art */
+function drawObstaclesLow(vx0, vy0, vx1, vy1) {
+  eachObstacle(vx0, vy0, vx1, vy1, function (o) {
+    ctx.save();
+    // ground shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.fillRect(o.x + 4, o.y + 5, o.w, o.h);
+    if (o.kind === 'sandbag') drawSandbags(o);
+    else if (o.kind === 'crate') drawCrate(o);
+    else if (o.kind === 'barrel') drawBarrel(o);
+    else if (o.kind === 'vehicle') drawVehicle(o);
+    else if (o.kind === 'wall') drawWall(o);
+    if (o.flash > 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+    }
+    ctx.restore();
+  });
+}
+function drawObstaclesHigh(vx0, vy0, vx1, vy1) { }
+
+// The command post the whole level points at: a concrete pad, a flag, a pulse.
+function drawObjective() {
+  if (OBJ.y < cam.y - 120 || OBJ.y > cam.y + viewH() + 120) return;
+  const t = time * 2;
+  ctx.save();
+  // pad
+  ctx.fillStyle = '#59564a';
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, OBJ.r, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#6b6857';
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, OBJ.r - 7, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(20,20,14,0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, OBJ.r, 0, TAU); ctx.stroke();
+  // hazard chevrons
+  ctx.strokeStyle = 'rgba(216,192,96,0.45)';
+  ctx.lineWidth = 4;
+  ctx.setLineDash([12, 10]);
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, OBJ.r - 13, 0, TAU); ctx.stroke();
+  ctx.setLineDash([]);
+  // pulse
+  const pr = OBJ.r + (t % 1) * 26;
+  ctx.strokeStyle = 'rgba(255,225,120,' + (0.45 * (1 - (t % 1))).toFixed(3) + ')';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, pr, 0, TAU); ctx.stroke();
+  // flag
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(OBJ.x - 1 + 4, OBJ.y - 2 + 4, 22, 4);
+  ctx.fillStyle = '#3a3730';
+  ctx.beginPath(); ctx.arc(OBJ.x, OBJ.y, 5, 0, TAU); ctx.fill();
+  const wave = Math.sin(time * 4) * 2;
+  ctx.fillStyle = '#c02a22';
+  ctx.beginPath();
+  ctx.moveTo(OBJ.x, OBJ.y - 3);
+  ctx.lineTo(OBJ.x + 26, OBJ.y - 6 + wave);
+  ctx.lineTo(OBJ.x + 26, OBJ.y + 3 + wave);
+  ctx.lineTo(OBJ.x, OBJ.y + 3);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawSandbags(o) {
+  const along = o.w >= o.h;
+  const n = Math.max(1, Math.round((along ? o.w : o.h) / 17));
+  ctx.fillStyle = '#5f5a3e';
+  ctx.fillRect(o.x, o.y, o.w, o.h);
+  for (let row = 0; row < 2; row++) {
+    for (let i = 0; i < n; i++) {
+      const off = (row % 2) * 8;
+      const bx = along ? o.x + i * (o.w / n) + off * 0.4 : o.x + row * (o.w / 2);
+      const by = along ? o.y + row * (o.h / 2) : o.y + i * (o.h / n) + off * 0.4;
+      const bw = along ? o.w / n - 1.5 : o.w / 2 - 1.5;
+      const bh = along ? o.h / 2 - 1.5 : o.h / n - 1.5;
+      if (bx > o.x + o.w || by > o.y + o.h) continue;
+      ctx.fillStyle = ((i + row) % 2) ? '#847c56' : '#6f6947';
+      roundRect(bx + 0.8, by + 0.8, Math.max(2, bw), Math.max(2, bh), 3);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(30,28,18,0.5)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+  ctx.strokeStyle = 'rgba(20,20,14,0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(o.x, o.y, o.w, o.h);
+}
+
+function drawCrate(o) {
+  const t = clamp(o.hp / o.maxHp, 0, 1);
+  ctx.fillStyle = '#7a5a30';
+  ctx.fillRect(o.x, o.y, o.w, o.h);
+  ctx.fillStyle = '#96703c';
+  ctx.fillRect(o.x + 2, o.y + 2, o.w - 4, o.h - 4);
+  ctx.strokeStyle = '#5c4322';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(o.x + 2, o.y + 2); ctx.lineTo(o.x + o.w - 2, o.y + o.h - 2);
+  ctx.moveTo(o.x + o.w - 2, o.y + 2); ctx.lineTo(o.x + 2, o.y + o.h - 2);
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(20,16,8,0.7)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(o.x + 0.5, o.y + 0.5, o.w - 1, o.h - 1);
+  // damage cracks
+  if (t < 0.7) {
+    ctx.strokeStyle = 'rgba(20,14,6,0.75)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(o.x + o.w * 0.2, o.y + o.h * 0.15);
+    ctx.lineTo(o.x + o.w * 0.45, o.y + o.h * 0.55);
+    ctx.lineTo(o.x + o.w * 0.3, o.y + o.h * 0.9);
+    if (t < 0.4) {
+      ctx.moveTo(o.x + o.w * 0.85, o.y + o.h * 0.2);
+      ctx.lineTo(o.x + o.w * 0.6, o.y + o.h * 0.7);
+    }
+    ctx.stroke();
+  }
+  // stencilled weapon mark so pickups are predictable
+  ctx.fillStyle = 'rgba(235,220,140,0.85)';
+  ctx.fillRect(o.cx - 5, o.cy - 1.5, 10, 3);
+  if (o.drop === 'flame') { ctx.fillStyle = 'rgba(255,120,40,0.9)'; ctx.fillRect(o.cx - 2, o.cy - 6, 4, 4); }
+  else if (o.drop === 'spread') { ctx.fillStyle = 'rgba(140,220,255,0.9)'; ctx.fillRect(o.cx - 6, o.cy - 6, 12, 3); }
+}
+
+function drawBarrel(o) {
+  ctx.fillStyle = '#7d3222';
+  ctx.beginPath(); ctx.arc(o.cx, o.cy, o.hx, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#a04530';
+  ctx.beginPath(); ctx.arc(o.cx - 1, o.cy - 1, o.hx * 0.8, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(20,10,6,0.7)';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(o.cx, o.cy, o.hx, 0, TAU); ctx.stroke();
+  ctx.fillStyle = '#d8c060';
+  ctx.beginPath(); ctx.arc(o.cx, o.cy, o.hx * 0.3, 0, TAU); ctx.fill();
+  if (o.fuse !== undefined && Math.floor(time * 20) % 2 === 0) {
+    ctx.fillStyle = 'rgba(255,220,120,0.8)';
+    ctx.beginPath(); ctx.arc(o.cx, o.cy, o.hx, 0, TAU); ctx.fill();
+  }
+}
+
+function drawWall(o) {
+  ctx.fillStyle = o.shade > 0 ? '#736c5e' : '#615b50';
+  ctx.fillRect(o.x, o.y, o.w, o.h);
+  // broken concrete: chew a couple of bites out of the outline
+  ctx.fillStyle = 'rgba(58,54,46,0.9)';
+  ctx.fillRect(o.x + o.w * 0.18, o.y - 2, o.w * 0.14, 4);
+  ctx.fillRect(o.x + o.w * 0.62, o.y + o.h - 2, o.w * 0.18, 4);
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillRect(o.x, o.y, o.w, Math.min(6, o.h));
+  ctx.strokeStyle = 'rgba(18,18,14,0.7)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(o.x + 1, o.y + 1, o.w - 2, o.h - 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  for (let y = o.y + 8; y < o.y + o.h - 4; y += 12) ctx.fillRect(o.x + 2, y, o.w - 4, 1.5);
+}
+
+function drawVehicle(o) {
+  const along = o.w >= o.h;
+  ctx.fillStyle = '#3a3a34';
+  roundRect(o.x, o.y, o.w, o.h, 6); ctx.fill();
+  ctx.fillStyle = '#4a4840';
+  roundRect(o.x + 4, o.y + 4, o.w - 8, o.h - 8, 5); ctx.fill();
+  // burnt cab
+  ctx.fillStyle = '#231f1a';
+  if (along) ctx.fillRect(o.x + o.w * 0.06, o.y + o.h * 0.18, o.w * 0.26, o.h * 0.64);
+  else ctx.fillRect(o.x + o.w * 0.18, o.y + o.h * 0.06, o.w * 0.64, o.h * 0.26);
+  ctx.fillStyle = 'rgba(16,14,12,0.85)';
+  if (along) ctx.fillRect(o.x + o.w * 0.4, o.y + o.h * 0.2, o.w * 0.5, o.h * 0.6);
+  else ctx.fillRect(o.x + o.w * 0.2, o.y + o.h * 0.4, o.w * 0.6, o.h * 0.5);
+  // wheels
+  ctx.fillStyle = '#191712';
+  const ww = along ? 12 : o.w * 0.3, wh = along ? o.h * 0.3 : 12;
+  if (along) {
+    ctx.fillRect(o.x + o.w * 0.16, o.y - 3, ww, 6);
+    ctx.fillRect(o.x + o.w * 0.68, o.y - 3, ww, 6);
+    ctx.fillRect(o.x + o.w * 0.16, o.y + o.h - 3, ww, 6);
+    ctx.fillRect(o.x + o.w * 0.68, o.y + o.h - 3, ww, 6);
+  } else {
+    ctx.fillRect(o.x - 3, o.y + o.h * 0.16, 6, wh);
+    ctx.fillRect(o.x - 3, o.y + o.h * 0.68, 6, wh);
+    ctx.fillRect(o.x + o.w - 3, o.y + o.h * 0.16, 6, wh);
+    ctx.fillRect(o.x + o.w - 3, o.y + o.h * 0.68, 6, wh);
+  }
+  ctx.strokeStyle = 'rgba(14,12,10,0.8)';
+  ctx.lineWidth = 2;
+  roundRect(o.x, o.y, o.w, o.h, 6); ctx.stroke();
+}
+
+/* ============================================================================
+   FLAME GUN: a continuous stream, not discrete bullets
+   ========================================================================== */
+function fireFlame(m) {
+  const n = 3;
+  for (let i = 0; i < n; i++) {
+    const a = player.aim + rnd(-0.15, 0.15);
+    const sp = rnd(470, 590);
+    const life = rnd(0.46, 0.60);
+    flames.push({
+      x: m.x + Math.cos(a) * rnd(0, 8), y: m.y + Math.sin(a) * rnd(0, 8),
+      vx: Math.cos(a) * sp + player.vx * 0.35,
+      vy: Math.sin(a) * sp + player.vy * 0.35,
+      life: life, max: life, dps: 56,
+      r: rnd(5, 8), grow: rnd(48, 70), seed: rnd(0, TAU)
+    });
+  }
+  player.muzzle = 0.05;
+  if (Math.random() < 0.25) addShake(0.5);
+}
+
+function updateFlames(dt) {
+  for (let i = flames.length - 1; i >= 0; i--) {
+    const f = flames[i];
+    f.life -= dt;
+    if (f.life <= 0) {
+      if (Math.random() < 0.25) {
+        spawnPart({ x: f.x, y: f.y, vx: f.vx * 0.06, vy: f.vy * 0.06, life: rnd(0.5, 1.1), r: f.r * 0.7, col: 'rgba(60,54,50,0.5)', type: 'smoke', drag: 1.5, grow: 22 });
+      }
+      // the stream leaves burning ground behind it: a doorway you can deny
+      if (!f.pool && Math.random() < 0.09 && flames.length < 240 && !pointInSolid(f.x, f.y, 0)) {
+        const pl = rnd(1.6, 2.8);
+        flames.push({
+          x: f.x, y: f.y, vx: 0, vy: 0, life: pl, max: pl, dps: 22,
+          r: rnd(13, 21), grow: 1.5, seed: rnd(0, TAU), pool: true
+        });
+        addDecal({ type: 'scorch', x: f.x, y: f.y, r: rnd(9, 16), rot: rnd(0, TAU), col: '#171208', a: 0.3 });
+      }
+      flames.splice(i, 1); continue;
+    }
+    f.x += f.vx * dt; f.y += f.vy * dt;
+    const drag = Math.exp(-1.8 * dt);
+    f.vx *= drag; f.vy *= drag;
+    f.r += f.grow * dt;
+    // fire piles up against cover instead of passing through it
+    if (pointInSolid(f.x, f.y, 0)) {
+      f.x -= f.vx * dt; f.y -= f.vy * dt;
+      f.vx *= -0.15; f.vy *= -0.15;
+      f.life = Math.min(f.life, 0.16);
+    }
+  }
+  applyFlameDamage(dt);
+}
+
+function applyFlameDamage(dt) {
+  if (!flames.length) return;
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (e.dead) continue;
+    let dps = 0;
+    for (let j = 0; j < flames.length; j++) {
+      const f = flames[j];
+      const rr = f.r + e.r;
+      if (dist2(f.x, f.y, e.x, e.y) < rr * rr && f.dps > dps) dps = f.dps;
+    }
+    if (dps > 0) {
+      e.hp -= dps * dt;
+      e.burn = 1.7;                 // keeps burning after leaving the flame
+      e.flash = Math.max(e.flash, 0.03);
+      if (e.hp <= 0) killEnemy(e, 0, 1);
+    }
+  }
+  // burning crates and barrels
+  for (let j = 0; j < flames.length; j++) {
+    const f = flames[j];
+    if (Math.random() > 0.25) continue;
+    eachObstacle(f.x - f.r, f.y - f.r, f.x + f.r, f.y + f.r, function (o) {
+      if (!o.hp || o.dead) return;
+      damageObstacle(o, 14 * dt * 4, 0, 0);
+    });
+  }
+}
+
+function drawFlames() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < flames.length; i++) {
+    const f = flames[i];
+    const t = clamp(f.life / f.max, 0, 1);
+    const r = f.r;
+    const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+    if (t > 0.72) {
+      g.addColorStop(0, 'rgba(255,255,225,' + (0.95 * t).toFixed(3) + ')');
+      g.addColorStop(0.35, 'rgba(255,214,90,' + (0.7 * t).toFixed(3) + ')');
+    } else {
+      g.addColorStop(0, 'rgba(255,196,80,' + (0.75 * t).toFixed(3) + ')');
+      g.addColorStop(0.35, 'rgba(255,120,26,' + (0.55 * t).toFixed(3) + ')');
+    }
+    g.addColorStop(0.72, 'rgba(200,52,10,' + (0.30 * t).toFixed(3) + ')');
+    g.addColorStop(1, 'rgba(60,10,4,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, r, 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawFlamePart(p, t) {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+  g.addColorStop(0, 'rgba(255,230,150,' + (0.8 * t).toFixed(3) + ')');
+  g.addColorStop(0.5, 'rgba(255,120,30,' + (0.5 * t).toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(80,16,4,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------------ pickups */
+let healFlash = 0;
+function spawnPickup(x, y, kind) {
+  pickups.push({ x, y, kind, t: 0, life: kind === 'med' ? 30 : 45 });
+}
+function updatePickups(dt) {
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.t += dt;
+    p.life -= dt;
+    if (p.life <= 0) { pickups.splice(i, 1); continue; }
+    if (!player.dead && dist2(p.x, p.y, player.x, player.y) < 26 * 26) {
+      if (p.kind === 'med') {
+        if (player.hp >= player.maxHp) continue;    // leave it for when it is needed
+        player.hp = Math.min(player.maxHp, player.hp + 35);
+        healFlash = 0.6;
+      } else {
+        giveWeapon(p.kind);
+      }
+      for (let k = 0; k < 10; k++) {
+        const a = rnd(0, TAU);
+        spawnPart({ x: p.x, y: p.y, vx: Math.cos(a) * rnd(30, 90), vy: Math.sin(a) * rnd(30, 90), life: rnd(0.2, 0.45), r: 2, col: '#f0e08a' });
+      }
+      pickups.splice(i, 1);
+    }
+  }
+}
+function drawPickups() {
+  for (let i = 0; i < pickups.length; i++) {
+    const p = pickups[i];
+    if (p.x < cam.x - 40 || p.x > cam.x + viewW() + 40 || p.y < cam.y - 40 || p.y > cam.y + viewH() + 40) continue;
+    const bob = Math.sin(p.t * 4) * 2;
+    const blink = p.life < 6 && Math.floor(p.life * 6) % 2 === 0;
+    ctx.save();
+    ctx.globalAlpha = blink ? 0.35 : 1;
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.ellipse(p.x, p.y + 8, 13, 6, 0, 0, TAU); ctx.fill();
+    // glowing pad
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(p.x, p.y + bob, 0, p.x, p.y + bob, 22);
+    const c = p.kind === 'flame' ? '255,130,40' : (p.kind === 'med' ? '120,255,150' : '120,210,255');
+    g.addColorStop(0, 'rgba(' + c + ',0.5)');
+    g.addColorStop(1, 'rgba(' + c + ',0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(p.x, p.y + bob, 22, 0, TAU); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.translate(p.x, p.y + bob);
+    if (p.kind === 'med') {
+      ctx.fillStyle = '#e8e4d8';
+      roundRect(-9, -7, 18, 14, 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(20,20,16,0.7)'; ctx.lineWidth = 1.4; ctx.stroke();
+      ctx.fillStyle = '#c02a22';
+      ctx.fillRect(-5.5, -1.8, 11, 3.6);
+      ctx.fillRect(-1.8, -5.5, 3.6, 11);
+      ctx.restore();
+      ctx.globalAlpha = 1;
+      continue;
+    }
+    ctx.rotate(-0.5);
+    ctx.fillStyle = '#2a2a22';
+    ctx.fillRect(-11, -3, 22, 6);
+    if (p.kind === 'flame') {
+      ctx.fillStyle = '#b8452a'; ctx.fillRect(4, -5.5, 7, 11);
+      ctx.fillStyle = '#5a5448'; ctx.fillRect(-12, -7, 6, 14);
+    } else {
+      ctx.fillStyle = '#4a4a3a'; ctx.fillRect(-4, -4.5, 9, 9);
+      ctx.fillStyle = '#8fd6ff'; ctx.fillRect(8, -2, 5, 4);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ------------------------------------------------------------ level layout */
+let levelSeed = 1;
+function buildLevel() {
+  const r = mulberry32(levelSeed);
+  buildObstacles(r);
+  buildEnemies(r);
+}
+function sandbag(x, y, len, vertical) {
+  return addObstacle(vertical
+    ? { kind: 'sandbag', x: x - 11, y: y - len / 2, w: 22, h: len, solid: true, blocks: true, chipCol: '#8a8058' }
+    : { kind: 'sandbag', x: x - len / 2, y: y - 11, w: len, h: 22, solid: true, blocks: true, chipCol: '#8a8058' });
+}
+function crate(x, y, drop) {
+  return addObstacle({
+    kind: 'crate', x: x - 16, y: y - 16, w: 32, h: 32, solid: true, blocks: true,
+    hp: 42, maxHp: 42, flash: 0, drop: drop, chipCol: '#a07a40'
+  });
+}
+function barrel(x, y) {
+  return addObstacle({
+    kind: 'barrel', x: x - 13, y: y - 13, w: 26, h: 26, solid: true, blocks: true,
+    hp: 22, maxHp: 22, flash: 0, chipCol: '#b05030'
+  });
+}
+function vehicle(x, y, vertical) {
+  return addObstacle(vertical
+    ? { kind: 'vehicle', x: x - 28, y: y - 52, w: 56, h: 104, solid: true, blocks: true, chipCol: '#6a655a' }
+    : { kind: 'vehicle', x: x - 52, y: y - 28, w: 104, h: 56, solid: true, blocks: true, chipCol: '#6a655a' });
+}
+function wallBlock(x, y, w, h) {
+  return addObstacle({ kind: 'wall', x: x - w / 2, y: y - h / 2, w: w, h: h, solid: true, blocks: true, chipCol: '#9a9488' });
+}
+
+function buildObstacles(r) {
+  obstacles = [];
+  const safeY = WORLD.h - 300;   // keep the drop zone clear
+
+  // scattered cover the length of the valley
+  for (let y = WORLD.h - 460; y > 620; y -= 200) {
+    const prog = 1 - y / WORLD.h;
+    const n = 2 + Math.floor(r() * 3);
+    for (let i = 0; i < n; i++) {
+      const x = 90 + r() * (WORLD.w - 180);
+      const yy = y + r() * 160 - 80;
+      if (yy > safeY) continue;
+      const t = r();
+      if (t < 0.34) {
+        sandbag(x, yy, 70 + r() * 90, r() < 0.35);
+      } else if (t < 0.62) {
+        crate(x, yy, r() < 0.5 ? 'spread' : 'flame');
+      } else if (t < 0.76) {
+        barrel(x, yy);
+      } else if (t < 0.88 && prog > 0.12) {
+        vehicle(x, yy, r() < 0.4);
+      } else {
+        // an entrenched firing position: an L of sandbags facing south
+        const len = 80 + r() * 60;
+        sandbag(x, yy, len, false);
+        sandbag(x - len / 2, yy + 30, 60, true);
+        if (r() < 0.5) crate(x + len / 2 + 20, yy + 10, r() < 0.5 ? 'spread' : 'flame');
+      }
+    }
+  }
+
+  // a couple of rubble ridges that force the player to pick a lane
+  for (let k = 0; k < 6; k++) {
+    const y = 1400 + k * 1250 + r() * 200;
+    const gap = 260 + r() * 180;
+    const gx = 250 + r() * (WORLD.w - 500);
+    for (let x = 60; x < WORLD.w - 60; x += 120) {
+      if (Math.abs(x - gx) < gap / 2) continue;
+      if (r() < 0.26) continue;
+      const t = r();
+      const jy = y + (r() - 0.5) * 44;
+      if (t < 0.16) sandbag(x + 30, jy, 90 + r() * 40, false);
+      else if (t < 0.24) barrel(x + 30, jy);
+      else wallBlock(x + 30, jy, 76 + r() * 48, 26 + r() * 16);
+    }
+  }
+
+  buildFortress(r);
+  buildObstacleGrid();
+}
+
+// The objective: the command post at the head of the valley.
+const OBJ = { x: WORLD.w / 2, y: 250, r: 46 };
+
+// The fortified position that caps the level.
+function buildFortress(r) {
+  const cy = 460;
+  // command post: three walls, open to the south so it must be entered on foot
+  wallBlock(OBJ.x - 78, OBJ.y + 6, 26, 128);
+  wallBlock(OBJ.x + 78, OBJ.y + 6, 26, 128);
+  wallBlock(OBJ.x, OBJ.y - 58, 182, 26);
+  for (let x = 120; x < WORLD.w - 120; x += 150) {
+    if (Math.abs(x - WORLD.w / 2) < 110) continue;    // gate
+    sandbag(x + 20, cy + 120, 130, false);
+  }
+  wallBlock(WORLD.w / 2 - 190, cy, 150, 46);
+  wallBlock(WORLD.w / 2 + 190, cy, 150, 46);
+  // inner wall, broken by the gate that leads up to the command post
+  wallBlock(OBJ.x - 200, cy - 120, 210, 50);
+  wallBlock(OBJ.x + 200, cy - 120, 210, 50);
+  sandbag(WORLD.w / 2 - 150, cy + 40, 90, true);
+  sandbag(WORLD.w / 2 + 150, cy + 40, 90, true);
+  vehicle(240, cy + 20, false);
+  vehicle(WORLD.w - 240, cy + 20, false);
+  barrel(WORLD.w / 2 - 60, cy - 40);
+  barrel(WORLD.w / 2 + 60, cy - 40);
+  crate(WORLD.w / 2 - 240, cy + 60, 'flame');
+  crate(WORLD.w / 2 + 240, cy + 60, 'spread');
+  for (let i = 0; i < 5; i++) {
+    barrel(180 + r() * (WORLD.w - 360), cy + 200 + r() * 120);
+  }
+}
+
+// find an open patch of ground near a band, so nobody spawns inside cover
+function freeSpot(r, y, spread) {
+  for (let k = 0; k < 24; k++) {
+    const x = 110 + r() * (WORLD.w - 220);
+    const yy = clamp(y + r() * spread - spread / 2, 60, WORLD.h - 60);
+    if (!pointInSolid(x, yy, 16)) return { x: x, y: yy };
+  }
+  return null;
+}
+
+// a firing position dug in behind a piece of cover, facing south down the valley
+function entrenchSpot(r, y, spread) {
+  for (let k = 0; k < 30; k++) {
+    const x = 110 + r() * (WORLD.w - 220);
+    const yy = clamp(y + r() * spread - spread / 2, 80, WORLD.h - 80);
+    let found = null;
+    eachObstacle(x - 160, yy - 160, x + 160, yy + 160, function (o) {
+      if (!o.blocks || o.kind === 'barrel' || o.kind === 'crate') return;
+      const sy = o.cy - (o.hy + 20);
+      const sx = o.cx + (r() - 0.5) * o.w * 0.6;
+      if (pointInSolid(sx, sy, 14)) return;
+      found = { x: sx, y: sy };
+      return true;
+    });
+    if (found) return found;
+  }
+  return freeSpot(r, y, spread);
+}
+
+function buildEnemies(r) {
+  // Bands of resistance running north. Density climbs as the player advances.
+  const startY = WORLD.h - 520;
+  for (let y = startY; y > 900; y -= 340) {
+    const prog = 1 - (y / WORLD.h);          // 0 at the south edge, 1 at the north
+    const n = Math.round(lerp(1, 4.5, prog) + r() * 1.6);
+    for (let i = 0; i < n; i++) {
+      const p = freeSpot(r, y, 250);
+      if (p) spawnEnemy('grunt', p.x, p.y);
+    }
+    if (prog > 0.14 && r() < 0.25 + prog * 0.6) {
+      const g = entrenchSpot(r, y, 250);
+      if (g) { const e = spawnEnemy('gunner', g.x, g.y); e.home.x = g.x; e.home.y = g.y; }
+    }
+    if (prog > 0.34 && r() < (prog - 0.3) * 0.9) {
+      const h = freeSpot(r, y, 250);
+      if (h) spawnEnemy('heavy', h.x, h.y);
+    }
+  }
+  buildGarrison(r);
+}
+
+// the fortified position at the top of the map
+function buildGarrison(r) {
+  const cy = 460;
+  for (let i = 0; i < 9; i++) {
+    const g = entrenchSpot(r, cy + 140, 220);
+    if (g) { const e = spawnEnemy('gunner', g.x, g.y); e.home.x = g.x; e.home.y = g.y; }
+  }
+  for (let i = 0; i < 5; i++) {
+    const h = freeSpot(r, cy + 40, 260);
+    if (h) spawnEnemy('heavy', h.x, h.y);
+  }
+  for (let i = 0; i < 10; i++) {
+    const p = freeSpot(r, cy + 260, 340);
+    if (p) spawnEnemy('grunt', p.x, p.y);
+  }
+  for (let i = 0; i < 6; i++) {
+    const p = freeSpot(r, 820, 260);
+    if (p) spawnEnemy(r() < 0.35 ? 'gunner' : 'grunt', p.x, p.y);
+  }
+}
+
+/* ---------------------------------------------------- reinforcement waves */
+let frontier = 0, nextWaveY = 0, waveN = 0, campT = 0;
+
+function updateLevel(dt) {
+  if (noiseT > 0) noiseT -= dt;
+  const gained = frontier - player.y;
+  if (player.y < frontier) frontier = player.y;
+  // digging in is not a strategy: sitting still calls down reinforcements
+  if (gained > 1.5) campT = 0; else campT += dt;
+  if (campT > 13) { campT = 0; if (nearbyEnemyCount() < 16) spawnWave(); }
+  if (frontier < nextWaveY) {
+    nextWaveY = frontier - 460;
+    spawnWave();
+  }
+  // the objective is taken by standing on the command post
+  if (!player.dead && dist(player.x, player.y, OBJ.x, OBJ.y) < OBJ.r) {
+    state = ST.WIN;
+    deathTimer = 0;
+    addShake(6);
+    for (let i = 0; i < 30; i++) {
+      const a = rnd(0, TAU);
+      spawnPart({ x: OBJ.x, y: OBJ.y, vx: Math.cos(a) * rnd(40, 220), vy: Math.sin(a) * rnd(40, 220), life: rnd(0.4, 1.1), r: rnd(2, 4), col: '#ffe08a' });
+    }
+  }
+}
+
+function nearbyEnemyCount() {
+  let n = 0;
+  for (let i = 0; i < enemies.length; i++) {
+    if (dist2(enemies[i].x, enemies[i].y, player.x, player.y) < 1500 * 1500) n++;
+  }
+  return n;
+}
+
+function spawnWave() {
+  waveN++;
+  const prog = clamp(1 - player.y / WORLD.h, 0, 1);
+  if (nearbyEnemyCount() > 18) return;
+  const n = Math.round(2 + prog * 4 + rnd(0, 1.4));
+  const aheadY = player.y - viewH() * 0.5 - rnd(90, 340);
+  if (aheadY < 260) return;
+  const r = Math.random;
+  for (let i = 0; i < n; i++) {
+    const t = Math.random();
+    let kind = 'grunt';
+    if (t < 0.16 + prog * 0.18) kind = 'gunner';
+    if (t > 0.86 - prog * 0.12 && prog > 0.3) kind = 'heavy';
+    const p = kind === 'gunner' ? entrenchSpot(r, aheadY, 320) : freeSpot(r, aheadY, 340);
+    if (!p) continue;
+    const e = spawnEnemy(kind, p.x, p.y);
+    e.home.x = p.x; e.home.y = p.y;
+    e.awake = true;
+  }
+}
+
+function startGame() {
+  levelSeed = (Math.random() * 1e9) | 0;   // a fresh valley every deployment
+  resetCombat();
+  resetPlayer();
+  buildScenery();
+  buildLevel();
+  snapCamera();
+  hurtFlash = 0; hudFlash = 0; deathTimer = 0;
+  frontier = player.y; nextWaveY = player.y - 700; waveN = 0;
+  campT = 0; noiseT = 0;
+  state = ST.PLAY;
+}
+
+/* --------------------------------------------------------------- main loop */
+let last = performance.now();
+let dbgFps = 60;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;      // clamp so a tab-out never teleports anything
+  time += dt;
+  dbgFps = dbgFps * 0.92 + (1 / Math.max(dt, 0.0001)) * 0.08;
+
+  if (state === ST.PLAY) {
+    updatePlayer(dt);
+    playerFire(dt);
+    updateEnemies(dt);
+    updateBullets(dt);
+    updateGrenades(dt);
+    updateFlames(dt);
+    updateParts(dt);
+    updateRings(dt);
+    updatePickups(dt);
+    updateObstacles(dt);
+    updateLevel(dt);
+    updateCamera(dt);
+  } else if (state === ST.DEAD || state === ST.WIN) {
+    deathTimer += dt;
+    updateBullets(dt);
+    updateGrenades(dt);
+    updateFlames(dt);
+    updateParts(dt);
+    updateRings(dt);
+    updateEnemies(dt);
+    updateCamera(dt);
+  }
+  if (hitMark > 0) hitMark = Math.max(0, hitMark - dt);
+  if (hurtFlash > 0) hurtFlash = Math.max(0, hurtFlash - dt * 2.8);
+  if (hudFlash > 0) hudFlash = Math.max(0, hudFlash - dt);
+  if (healFlash > 0) healFlash = Math.max(0, healFlash - dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#191a12';
+  ctx.fillRect(0, 0, VW, VH);
+
+  ctx.save();
+  ctx.scale(ZOOM, ZOOM);
+  ctx.translate(-cam.x + cam.sx, -cam.y + cam.sy);
+  const vx0 = cam.x - 40, vy0 = cam.y - 40, vx1 = cam.x + viewW() + 40, vy1 = cam.y + viewH() + 40;
+  drawGround(vx0, vy0, vx1, vy1);
+  drawDecals(vx0, vy0, vx1, vy1);
+  drawObjective();
+  drawPickups();
+  drawObstaclesLow(vx0, vy0, vx1, vy1);
+  drawEnemies();
+  if (!player.dead) drawPlayer();
+  if (player.muzzle > 0) drawMuzzleFlash(player);
+  drawBullets();
+  drawGrenades();
+  drawObstaclesHigh(vx0, vy0, vx1, vy1);
+  drawFlames();
+  drawParts();
+  drawRings();
+  ctx.restore();
+
+  drawOverlays();
+  drawHUD();
+  drawScreens();
+  if (state === ST.PLAY) drawCrosshair();
+}
+
+buildGroundPattern();
+startGame();
+state = ST.TITLE;      // the live valley sits behind the title card
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
